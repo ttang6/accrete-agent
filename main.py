@@ -52,6 +52,7 @@ from nanoagent.tool.load_skill import LoadSkillTool
 from nanoagent.tool.registry import ToolRegistry
 from nanoagent.tool.search import SearchTool
 from nanoagent.tool.skill_exec import SkillExecTool
+from nanoagent.tool.subagent_tool import SubAgentTool
 
 # ============================================================
 # 运行参数（改这里就改行为，不需要命令行）
@@ -91,6 +92,13 @@ DISTILL_CADENCE_TURNS_N: int = 30     # cadence 轮次阈值
 DISTILL_CADENCE_MINUTES_T: int = 30   # cadence 时间阈值（分钟）
 DISTILL_OVERLAP: int = 3              # 窗口回看重叠条数
 SUBAGENT_MAX_ITERATIONS: int = 1      # 零工具 policy sub-agent 上限
+
+# SubAgent 研究子 agent（联网 search + fetch，结论隔离回主对话）
+SUBAGENT_RESEARCH_MAX_ITER: int = 6
+SUBAGENT_RESEARCH_PROMPT: str = """你是一个研究子 agent。用 search / fetch 工具就给定任务查证，返回简洁、有依据的结论。
+- 先 search 找来源，再 fetch 读关键页面。
+- 只回结论 + 关键依据 / 链接，不要过程独白。
+- 查不到就如实说，不要编造。"""
 ARXIV_STORAGE_DIR: Path = Path("data/arxiv_papers")  # arxiv-mcp-server 本地存储
 LESSONS_DB_PATH: Path = _DEFAULT_LESSONS_DB_PATH  # SSOT 在 sqlite_backend.DEFAULT_DB_PATH
 def _env_bool(name: str, default: bool) -> bool:
@@ -190,6 +198,18 @@ def build_registry(skill_loader: SkillLoader) -> ToolRegistry:
     registry.register(CalcTool())
     if os.getenv("TAVILY_API_KEY") or os.getenv("EXA_API_KEY"):
         registry.register(SearchTool())
+    # SubAgent 委派：一个能联网 search + fetch 的研究子 agent，暴露给主 LLM。
+    # 隔离价值——啰嗦的搜索 / 抓取过程留在子 agent context，只回结论，不污染主对话。
+    # runner 共享本 registry：裁剪时按 allowlist 留 search/fetch，剔除 is_subagent（防套娃）。
+    research_runner = SubAgentRunner(llm_builder=build_subagent_llm, base_tool_registry=registry)
+    registry.register(SubAgentTool(
+        name="research",
+        description="委派一个能联网搜索 + 抓取网页的子 agent 完成研究 / 查证子任务，只回结论（隔离上下文，不污染主对话）",
+        system_prompt=SUBAGENT_RESEARCH_PROMPT,
+        runner=research_runner,
+        allowed_tools=("web_search", "fetch"),
+        max_iterations=SUBAGENT_RESEARCH_MAX_ITER,
+    ))
     return registry
 
 
