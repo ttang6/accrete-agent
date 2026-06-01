@@ -1,0 +1,53 @@
+[project]
+name = "nanoagent"
+version = "0.2.0"
+description = "Lightweight agent framework that learns from failure traces, aligned with nanobot philosophy."
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    "openai>=1.40",
+    "requests>=2.31",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+    "numpy>=1.26",
+    "beautifulsoup4>=4.12",
+    "fastfeedparser>=0.3.0",
+    "trafilatura>=1.12",
+    "html2text>=2024.2",
+    "tiktoken>=0.7",
+    "exa-py>=2.12.0",
+    "mcp>=1.27.0",
+    "jsonschema>=4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+# ai-digest skill 需要的依赖。skill 作为可分发单元自带声明。
+# 激活：`uv pip install -e ".[digest]"`（trafilatura / pyyaml / requests 虽已在主依赖，
+# 仍在此重复声明，保证 extra 语义自包含：装这一组就能独立跑 digest skill）。
+digest = [
+    "fastfeedparser>=0.3.0",
+    "trafilatura>=1.12",
+    "pyyaml>=6.0",
+    "requests>=2.31",
+    "httpx>=0.27",
+]
+# Telegram channel（run_bot.py）依赖。激活：`uv pip install -e ".[telegram]"`。
+# python-telegram-bot 22.7：archived v1 实战版本；2025 最稳定 long-poll 框架。
+telegram = [
+    "python-telegram-bot>=22.7",
+    "python-dotenv>=1.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+nanoagent = ["py.typed"]

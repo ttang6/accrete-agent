@@ -1,0 +1,71 @@
+# ───────────── Python ─────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# ───────────── Test / lint caches ─────────────
+.pytest_cache/
+.pytest_tmp*/
+.ruff_cache/
+.mypy_cache/
+# tempfile.mkdtemp() 残留目录（无 prefix 时是 tmpXXXXXXXX 格式）
+tmp[a-z0-9]*/
+tmp_review/
+
+# ───────────── Secrets（含真实密钥，绝不入库）─────────────
+.env
+.env.local
+.env.*.local
+
+# ───────────── Node（Claude Code / claude-hud 副产品，与框架无关）─────────────
+node_modules/
+package.json
+package-lock.json
+
+# ───────────── 运行时数据 / 隐私（整目录一刀切）─────────────
+# 含 user_facts / digest_reported / sessions / reflexions / logs / traces / dogfood / cache 等
+data/
+
+# eval 实跑报告（运行时产物；保留 evals/ 源码）
+evals/reports/
+
+# ───────────── IDE / 编辑器 / 工具配置 ─────────────
+.obsidian/
+.vscode/
+.idea/
+.claude/
+*.swp
+
+# ───────────── OS ─────────────
+.DS_Store
+Thumbs.db
+
+# ───────────── 本地工作文档 / 草稿 / review 产物（不公开决策推演）─────────────
+# 临时粘贴
+temp.txt
+# 早期调研报告（文件名 drift 防御：mem_0 / mem0 都匹配）
+p_4_lite_mem*route_report.md
+# 人工抽检 + review packet（含个人查询样本）
+manual_spot_check_30.md
+nanoagent_arch_review_packet.md
+
+# ───────────── docs：默认全部本地保留；如需公开少数说明文档，删掉下面对应行并用 !docs/README.md 等逐个放行 ─────────────
+# 注意：'公开哪些章节'是 YELLOW 决策，由用户拍板后再调整本段
+docs/64_*.md
+docs/65_*.md
+docs/66_*.md
+docs/67_*.md
+docs/68_*.md
+docs/69_*.md
+docs/70_*.md
+docs/7[2-9]_*.md
+docs/80_*.md
+docs/_*.md
+docs/code_size.md
+docs/codex_dogfood/
+docs/plans/
