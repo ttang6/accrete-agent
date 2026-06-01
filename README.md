@@ -1,18 +1,12 @@
 # nanoagent
 
-> 超轻量、带**反馈学习**能力的 agent 框架 —— LLM 全权决策的 tool-use 主循环 + 从失败 trace 自动学习的 lesson 飞轮，并附一个完整的 AI 日报 Telegram Bot 作为 reference implementation。
+> 超轻量 agent 框架 —— LLM 全权决策的 tool-use 主循环 + 两层反馈学习（失败 → lesson、对话 → 偏好），并附一个完整的 AI 日报 Telegram Bot 作为 reference implementation。
 
-## 差异化
+## 特点
 
-- **反馈学习**：agent 跑失败 → trace 自动抽成 lesson → 状态机筛选 → 下次同类失败时召回注入。整条飞轮无 LLM consolidator、不依赖 DSPy/GEPA，纯规则驱动。
-- **完整产品形态**：不止有 loop，还有常驻 Telegram Bot + 主动日报 + HITL 反馈的 reference impl（`skills/ai-digest`）。
-- **效果经过实测**：50 fixture × 144 trial 跨 model ablation：
-
-  | 指标 | baseline | evolved |
-  |---|---|---|
-  | lesson 召回使用率 | 0 | **0.64** |
-  | helped 次数 | 0 | **58** |
-  | 弱-中档 model 上岗率 | — | **单调 ~20×** |
+- **两层反馈学习**：系统层从失败 trace 沉淀 lesson、同类失败时召回；用户层从对话蒸馏 skill 偏好、作软指导注入。规则驱动，无额外 LLM consolidator。
+- **完整形态**：不止 loop，还有常驻 Telegram Bot + 主动日报 + HITL 反馈，reference impl 是 `skills/ai-digest`。
+- **经过简单的Agent Evaluation**：`evals/` 用跨 model ablation 量反馈学习前后的差异。
 
 ## 快速开始
 
@@ -53,9 +47,11 @@ run_bot.py      Telegram channel 薄壳
 skills/ai-digest/   reference skill：AI 日报抓取 / 去重 / 评审
 ```
 
-## 反馈学习飞轮
+## 反馈学习
 
-核心思路：把每次失败留下的 trace 当作可复用的经验来源，自动沉淀成下次能召回的 lesson。
+两个轴：从**失败**学（系统层）+ 从**对话**学用户偏好（用户层）。
+
+**系统层** —— 把每次失败留下的 trace 当作可复用经验，自动沉淀成下次能召回的 lesson：
 
 ```
 跑任务 → 失败写进 trace
@@ -67,6 +63,8 @@ skills/ai-digest/   reference skill：AI 日报抓取 / 去重 / 评审
 ```
 
 lesson 全程持久化在 SQLite，进程重启不丢；阈值可由 `NANOAGENT_PROMOTION_*` 环境变量覆盖。
+
+**用户层** —— 一个隔离的副 agent 把近期对话蒸成 skill 级 NL 偏好 summary，经语义闸门 + 存储硬校验后落盘，下次进该 skill 时作为软指导注入；在 turn / skill / session 边界按节奏触发，保守写入。
 
 ## 测试
 
