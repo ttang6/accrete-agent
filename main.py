@@ -1,0 +1,496 @@
+"""nanoagent v2 CLI 入口 — channel 薄壳。
+
+装配：LLMClient + ToolRegistry + MainLoop + SessionStore + SkillLoader + UserFacts
+      + ReflexionStore + Harness（channel-agnostic orchestrator）
+
+两种运行模式由顶部常量 `TASK` / `TASK_FILE` 切换：
+- 两者非空 → one-shot 模式（stateless，不过 Harness / Session / UserFacts）
+- 都为空 → REPL 模式（CLI channel 只管 stdin/stdout，编排走 harness.handle）
+
+改参数就改顶部常量。不走 argparse，不走 env（env 仅 API key / OPENAI_MODEL_ID）。
+"""
+
+import os
+import sys
+from pathlib import Path
+from typing import Optional
+
+from nanoagent.core.llm_client import LLMClient
+from nanoagent.evolution.preference_distiller import PreferenceDistiller
+from nanoagent.evolution.reflexion import ReflexionStore
+from nanoagent.evolution.skill_preference_audit import SkillPreferenceAuditWriter
+from nanoagent.evolution.skill_preference_store import SkillPreferenceStore
+from nanoagent.evolution.runtime_memory.lesson_ingestor import LessonIngestor
+from nanoagent.evolution.runtime_memory.lesson_retriever import LessonRetriever
+from nanoagent.evolution.runtime_memory.outcome_tracker import OutcomeTracker
+from nanoagent.evolution.runtime_memory.promotion_audit import JsonlAuditWriter
+from nanoagent.evolution.runtime_memory.promotion_gate import PromotionGate
+from nanoagent.evolution.runtime_memory.sqlite_backend import (
+    DEFAULT_DB_PATH as _DEFAULT_LESSONS_DB_PATH,
+    SqliteMemoryBackend,
+)
+from nanoagent.memory.user_facts import UserFacts
+from nanoagent.core.paths import data_dir
+from nanoagent.runtime.context_budget import ContextBudgetConfig
+from nanoagent.runtime.evaluator import DigestEvaluator
+from nanoagent.runtime.harness import Harness
+from nanoagent.runtime.main_loop import MainLoop
+from nanoagent.runtime.session import SessionStore
+from nanoagent.runtime.token_counter import TokenCounter
+from nanoagent.runtime.tool_output_store import ToolOutputStore
+from nanoagent.skills.contract import aggregate_coverage_specs
+from nanoagent.skills.loader import SkillLoader
+from nanoagent.tool.arxiv import ArxivTool
+from nanoagent.tool.calc import CalcTool
+from nanoagent.tool.describe_script import DescribeScriptTool
+from nanoagent.tool.fetch import FetchTool
+from nanoagent.tool.load_skill import LoadSkillTool
+from nanoagent.tool.registry import ToolRegistry
+from nanoagent.tool.search import SearchTool
+from nanoagent.tool.skill_exec import SkillExecTool
+
+# ============================================================
+# 运行参数（改这里就改行为，不需要命令行）
+# ============================================================
+
+# 任务模式：两者都为空进 REPL；非空进 one-shot
+TASK: str = ""
+TASK_FILE: str = ""  # 路径字符串，按 utf-8 读取
+
+# LLM 参数
+MODEL: str = os.getenv("OPENAI_MODEL_ID", "gpt-5.4-mini")
+PROVIDER: str = ""  # 留空 = openai；可选 dashscope / zhipu / deepseek / ollama / vllm
+MAX_ITERATIONS: int = 20
+
+# P0.3 副 LLM Evaluator（日报质量评审）。DASHSCOPE_API_KEY 未设时跳过。
+EVALUATOR_MODEL: str = "qwen-plus"
+EVALUATOR_PROVIDER: str = "dashscope"
+EVALUATOR_TIMEOUT: int = 15  # 秒；副 LLM 超过即 fail-open 走 finalize
+EVALUATOR_MAX_RETRIES: int = 1  # advisor 原话"非常小但非常硬"，一次 retry 足够
+
+# 持久化路径
+CLI_SESSION_KEY: str = "cli:default"
+SESSION_DIR: Path = Path("data/runtime/sessions")
+SKILLS_DIR: Path = Path("skills")
+USER_FACTS_PATH: Path = Path("data/memory/user_facts.json")
+REFLEXIONS_DIR: Path = Path("data/reflexions")
+SKILL_PREFERENCES_PATH: Path = Path("data/memory/skill_preferences.json")
+SKILL_PREFERENCES_AUDIT_PATH: Path = Path("data/memory/skill_preferences_audit.jsonl")
+
+# PreferenceDistiller-Lite：副 LLM (qwen-flash via dashscope) 在 skill_switch /
+# session_end 触发蒸馏 NL preference summary。DASHSCOPE_API_KEY 缺失 → distiller=None
+# → Harness hook 静默跳过，向后兼容。
+DISTILLER_MODEL: str = "qwen-flash"
+DISTILLER_PROVIDER: str = "dashscope"
+DISTILLER_TIMEOUT: int = 15
+DISTILLER_MIN_TURNS: int = 10
+DISTILLER_DEBOUNCE_MIN: int = 30
+ARXIV_STORAGE_DIR: Path = Path("data/arxiv_papers")  # arxiv-mcp-server 本地存储
+LESSONS_DB_PATH: Path = _DEFAULT_LESSONS_DB_PATH  # SSOT 在 sqlite_backend.DEFAULT_DB_PATH
+def _env_bool(name: str, default: bool) -> bool:
+    """env override helper：未设 / 空字符串 → default；'0'/'false'/'no' → False；其他 truthy → True。
+
+    eval harness 用 NANOAGENT_ENABLE_LESSON_RECALL=0 跑 baseline、=1 跑 evolved，
+    同一份代码两种模式不必改源文件。"""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+ENABLE_LESSON_RECALL: bool = _env_bool("NANOAGENT_ENABLE_LESSON_RECALL", True)  # Phase C：第 1 次失败时也查 backend 中的 promoted lesson
+# PreferenceDistiller-Lite 装配开关。DASHSCOPE_API_KEY 缺失也会自然降级为 None。
+ENABLE_PREFERENCE_DISTILLER: bool = _env_bool("NANOAGENT_ENABLE_PREFERENCE_DISTILLER", True)
+
+# Phase E-v1：PromotionGate 自动 candidate ↔ promoted ↔ retired 决策。
+# 阈值都是 v1 拍脑袋（advisor 反对的那个但温和），靠 P2 INEFFECTIVE 自动降级机制
+# 把"promote 错"的代价压低。等真实 stats 沉淀后用 nanoagent.lesson list --json 校准。
+#
+# PR 4：阈值也可由环境变量 `NANOAGENT_PROMOTION_*` 覆盖（promotion_gate.py 模块级
+# 一次性读，进程启动后不热重载）。下面 4 个常量是 main.py 默认装配传入值——同时
+# 也是文档常量，env 优先级最高。
+ENABLE_PROMOTION_GATE: bool = _env_bool("NANOAGENT_ENABLE_PROMOTION_GATE", True)
+PROMOTION_EVIDENCE_MIN: int = 3  # candidate 被 N 个不同 trace 见过 → PROBATION（试用）
+PROMOTION_HELPED_MIN: int = 1    # E-v1.1：PROBATION 真用过且 helped ≥ N → PROMOTED
+PROMOTION_RETIRE_HURT_MIN: int = 3  # lesson 召回后真失败 ≥ N 次 → RETIRED
+PROMOTION_RETIRE_INEFFECTIVE_MIN: int = 3  # lesson 累计 INEFFECTIVE ≥ N → RETIRED
+# PR 4 follow-up：每次 sweep 命中转移追加一行 JSON 到此文件，事后用 jq / tail
+# 反推飞轮 lifecycle。父目录构造时自动创建；空字符串可关 audit。
+PROMOTION_AUDIT_LOG_PATH: Path = Path("data/runtime/lessons/promotion_audit.jsonl")
+
+# P4-lite D-context：Context Hygiene Foundation 默认开启
+ENABLE_CONTEXT_HYGIENE: bool = True
+CONTEXT_MAX_TOKENS: int = 80_000
+CONTEXT_WARN_RATIO: float = 0.8
+CONTEXT_HARD_RATIO: float = 0.95
+TOOL_OUTPUT_MAX_SINGLE_TOKENS: int = 2_000
+TOOL_OUTPUT_MAX_TOTAL_TOKENS: int = 12_000
+TOOL_OUTPUTS_DIR_NAME: str = "tool_outputs"
+
+BASE_IDENTITY: str = """# Role
+你是一个具备高度自主权与逻辑分析能力的智能 Agent 核心。通过精准的逻辑推理和工具调用，高效、闭环地解决用户问题。
+
+# 决策方式
+每轮"调工具 vs 直接答"之前，简要判断：
+- 任务是否需要外部信息？已有上下文够不够？
+- 若调工具，哪个最直接命中？（不凭直觉选熟悉的工具）
+- 多条信息可并行？单次响应并发调用降低延迟
+- 上下文充足时直接结构化回答，不做无效工具调用
+- 根据工具返回的实际反馈随时调整策略——换关键词、切换工具、或总结收尾
+
+# 错误处理（Critical）
+主动监控工具运行状态，严禁静默忽略失败：
+
+1. **识别失败**：工具返回含 `[... 错误]` / `[error]` / "退出码" 非 0 / Traceback / Exception 等失败标志，视为执行异常
+2. **先尝试修复**：换参数、换替代工具、或基于已获取的部分信息降级完成
+3. **修复成功** → 在最终输出末尾简短标注受影响范围（如"论文部分因 HF API 异常，改用 arxiv 替代"），不必打断主流程
+4. **修复失败** → 明确告知用户：失败的工具名 / 报错关键点 / 为什么无法继续 / 是否需要进一步指令
+
+# Response Standards
+- **结构化**：优先使用 Markdown 标题、列表、表格
+- **高信息增益**：拒绝废话，直接呈现核心数据、结论、代码
+- **溯源**：引用工具数据时保留原始来源或链接"""
+
+
+# ============================================================
+# 装配
+# ============================================================
+
+def read_utf8_file(file_path: str) -> str:
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"任务文件不存在: {path}")
+    return path.read_text(encoding="utf-8").strip()
+
+
+def build_registry(skill_loader: SkillLoader) -> ToolRegistry:
+    """注册所有可被 LLM 调的 BaseTool。
+
+    skill_loader 作为依赖注入：LoadSkillTool 在 schema 里动态列出当前 skills，
+    热增删 skill 后调 loader.reload() 即反映到下一轮 LLM 调用。
+    """
+    registry = ToolRegistry()
+    registry.register(FetchTool())
+    registry.register(SkillExecTool(skills_dir=SKILLS_DIR))
+    registry.register(DescribeScriptTool(skills_dir=SKILLS_DIR))
+    registry.register(LoadSkillTool(skill_loader=skill_loader))
+    registry.register(ArxivTool(storage_path=ARXIV_STORAGE_DIR))
+    # CalcTool：V2 strict baseline 验证 probe（详见 src/nanoagent/tool/calc.py 顶部注释）。
+    # 完全静态 schema → 唯一一个开 strict_mode=True 的 BaseTool，跟 SkillExecTool 撞墙形成对照。
+    registry.register(CalcTool())
+    if os.getenv("TAVILY_API_KEY") or os.getenv("EXA_API_KEY"):
+        registry.register(SearchTool())
+    return registry
+
+
+def build_runtime_memory(
+    *,
+    sqlite_check_same_thread: bool = True,
+) -> tuple[
+    Optional[LessonRetriever],
+    Optional[OutcomeTracker],
+    Optional[LessonIngestor],
+    Optional[PromotionGate],
+]:
+    """Phase C/D/B/E-v1：装配 SqliteMemoryBackend → 共享给 retriever / outcome /
+    ingestor / promotion_gate。
+
+    sqlite_check_same_thread:
+        CLI 默认 True（main thread 装配 + 使用，sqlite3 自带保护）。
+        Telegram bot（run_bot.py）传 False——main thread 装配 + 单 worker
+        thread 使用，配合 channel 内置 single-worker ThreadPoolExecutor 串行
+        消费。
+
+    `ENABLE_LESSON_RECALL=False` 时四 None → MainLoop / Harness 退化到 P0.2 行为。
+    `ENABLE_PROMOTION_GATE=False` 时 retriever / outcome / ingestor 仍正常，仅 gate 为 None。
+    backend 异常（库文件损坏 / 权限）时全部降级 None，不阻断 agent 启动。
+
+    生命周期：atexit 注册 backend.close()，进程退出时 commit + 释放 SQLite 句柄。
+
+    所有组件共享同一 backend：retriever 读 promoted lesson 注入 hint；
+    outcome_tracker 写已用 lesson 的 stats/confidence；ingestor 把 trace 失败
+    转 candidate lesson 入库；promotion_gate 在 turn 结束后扫所有 candidate /
+    promoted lesson 自动 promote / retire——四者同 SQLite 文件，事务一致。
+    """
+    if not ENABLE_LESSON_RECALL:
+        return None, None, None, None
+    try:
+        import atexit
+        backend = SqliteMemoryBackend(
+            db_path=LESSONS_DB_PATH,
+            check_same_thread=sqlite_check_same_thread,
+        )
+        atexit.register(backend.close)
+        gate = PromotionGate(
+            backend,
+            promote_evidence_min=PROMOTION_EVIDENCE_MIN,
+            promote_helped_min=PROMOTION_HELPED_MIN,
+            retire_hurt_min=PROMOTION_RETIRE_HURT_MIN,
+            retire_ineffective_min=PROMOTION_RETIRE_INEFFECTIVE_MIN,
+        ) if ENABLE_PROMOTION_GATE else None
+        return (
+            LessonRetriever(backend),
+            OutcomeTracker(backend),
+            LessonIngestor(backend),
+            gate,
+        )
+    except Exception as e:
+        print(f"[main] runtime_memory 装配失败（已降级，agent 仍可正常启动）: {e}")
+        return None, None, None, None
+
+
+def build_preference_distiller(
+    store: SkillPreferenceStore,
+    audit: SkillPreferenceAuditWriter,
+) -> Optional[PreferenceDistiller]:
+    """PreferenceDistiller-Lite：装配副 LLM (qwen-flash via dashscope) + 注入 store/audit。
+
+    DASHSCOPE_API_KEY 缺失 / ENABLE_PREFERENCE_DISTILLER=False → None，
+    Harness hook 会静默跳过（向后兼容）。
+    """
+    if not ENABLE_PREFERENCE_DISTILLER:
+        return None
+    if not os.getenv("DASHSCOPE_API_KEY"):
+        return None
+    try:
+        llm = LLMClient(
+            model=DISTILLER_MODEL,
+            provider=DISTILLER_PROVIDER,
+            instance_name="distiller",
+            timeout=DISTILLER_TIMEOUT,
+        )
+        return PreferenceDistiller(
+            llm=llm,
+            store=store,
+            audit_writer=audit,
+            min_turns=DISTILLER_MIN_TURNS,
+            debounce_minutes=DISTILLER_DEBOUNCE_MIN,
+        )
+    except Exception as e:
+        print(f"[main] PreferenceDistiller 装配失败（已降级）: {e}")
+        return None
+
+
+def build_context_hygiene() -> tuple[
+    Optional[TokenCounter], Optional[ToolOutputStore], Optional[ContextBudgetConfig]
+]:
+    """P4-lite D-context：装配 TokenCounter / ToolOutputStore / ContextBudgetConfig。
+
+    `ENABLE_CONTEXT_HYGIENE=False` 时三件全 None → MainLoop 退化到 Phase 3a/B+ 行为
+    （chars/4 估算 + max_tool_output_chars 字符截断 + 单点 warning），向后兼容。
+
+    ToolOutputStore 无常驻句柄，每次 store_if_needed 一次性 open-write-close，
+    不需要 atexit close。
+    """
+    if not ENABLE_CONTEXT_HYGIENE:
+        return None, None, None
+    counter = TokenCounter()
+    tool_outputs_dir = data_dir(TOOL_OUTPUTS_DIR_NAME)
+    store = ToolOutputStore(
+        base_dir=tool_outputs_dir,
+        token_counter=counter,
+        max_single_tokens=TOOL_OUTPUT_MAX_SINGLE_TOKENS,
+    )
+    budget_cfg = ContextBudgetConfig(
+        max_context_tokens=CONTEXT_MAX_TOKENS,
+        warn_ratio=CONTEXT_WARN_RATIO,
+        hard_ratio=CONTEXT_HARD_RATIO,
+        max_single_tool_tokens=TOOL_OUTPUT_MAX_SINGLE_TOKENS,
+        max_total_tool_tokens_per_run=TOOL_OUTPUT_MAX_TOTAL_TOKENS,
+    )
+    return counter, store, budget_cfg
+
+
+def build_loop(
+    skill_loader: SkillLoader,
+    *,
+    lesson_retriever: Optional[LessonRetriever] = None,
+) -> MainLoop:
+    """构造 MainLoop。lesson_retriever 由调用方装配——避免本函数重复 build
+    SqliteBackend（Phase D 引入 OutcomeTracker 后需共享同一 backend）。
+
+    PR 2 + advisor §3.B：装配期扫所有 skill 的 coverage manifest（skill.yaml）→
+    union 合并 specs 传给 MainLoop。skill 未声明 coverage 段时返空列表 →
+    MainLoop 跳过 coverage 检查（framework 不内建任何 skill 知识）。
+    """
+    llm = LLMClient(
+        model=MODEL,
+        provider=PROVIDER or None,
+        instance_name="main_loop",
+    )
+    counter, store, budget_cfg = build_context_hygiene()
+    contracts = [skill_loader.get_contract(n) for n in skill_loader.list_skills()]
+    coverage_specs = aggregate_coverage_specs(contracts) or None
+    return MainLoop(
+        name="assistant",
+        llm=llm,
+        tool_registry=build_registry(skill_loader),
+        max_iterations=MAX_ITERATIONS,
+        coverage_specs=coverage_specs,
+        lesson_retriever=lesson_retriever,
+        token_counter=counter,
+        tool_output_store=store,
+        context_budget_config=budget_cfg,
+    )
+
+
+def resolve_task() -> str:
+    if TASK:
+        return TASK.strip()
+    if TASK_FILE:
+        return read_utf8_file(TASK_FILE)
+    return ""
+
+
+def print_llm_instances() -> None:
+    """打印当前已创建的 LLM 实例 -> 模型映射。"""
+    llm_rows = LLMClient.describe_instances()
+    if not llm_rows:
+        return
+    print("[LLM Instances]")
+    for idx, row in enumerate(llm_rows, 1):
+        print(f"  {idx}. {row['instance_name']} -> {row['model']}")
+
+
+# ============================================================
+# 运行模式
+# ============================================================
+
+def run_once(loop: MainLoop, task: str) -> int:
+    """One-shot，stateless，不接 Session / UserFacts / Skill。"""
+    if not task:
+        print("任务不能为空。")
+        return 1
+    print(f"Task: {task}\n")
+    answer = loop.run([{"role": "user", "content": task}])
+    print("=" * 60)
+    print(answer)
+    print(f"\n({loop.llm.usage})")
+    return 0
+
+
+def repl(harness: Harness) -> int:
+    """CLI channel：只管 stdin/stdout，编排走 harness.handle。"""
+    header = "nanoagent v2 REPL。"
+    n_sessions = len(harness.list_sessions())
+    if n_sessions > 0:
+        header += f"已存 {n_sessions} 个历史会话（首句消息默认开新会话；用 /resume <key> 续上）。"
+    header += (
+        "\n命令：/skills | /skill <name> | /profile | "
+        "/sessions | /new (=/clear) | /resume <key> | exit"
+    )
+    print(header)
+
+    while True:
+        try:
+            tag = f"[{harness.current_skill}] " if harness.current_skill else ""
+            text = input(f"\n{tag}>>> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n已退出。")
+            return 0
+
+        if text.lower() in {"exit", "quit"}:
+            print("已退出。")
+            return 0
+        if not text:
+            continue
+
+        resp = harness.handle(text)
+        if resp.kind == "system":
+            print(resp.content)
+        else:
+            print("\n" + "=" * 60)
+            print(resp.content)
+            if resp.usage:
+                print(f"\n({resp.usage})")
+
+
+# ============================================================
+# 入口
+# ============================================================
+
+def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+    # stdin 也强制 UTF-8——非交互场景（codex / pipe）下父进程可能写 UTF-8 字节
+    # 但 Windows Python 默认按 cp936 解，触发 errors='replace' 把中文变 '?'。
+    # errors='replace' 这里是兜底（如果父进程真写了非 UTF-8 字节，至少不崩）
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+
+    # 装配顺序：reflexions → loader → runtime_memory（共享 backend） → loop
+    # LoadSkillTool 依赖 loader 的动态 description，必须先建好 loader
+    # Phase D：lesson_retriever + outcome_tracker 共享同一 SqliteBackend
+    reflexions = ReflexionStore(REFLEXIONS_DIR)
+    preference_store = SkillPreferenceStore(SKILL_PREFERENCES_PATH)
+    preference_audit = SkillPreferenceAuditWriter(SKILL_PREFERENCES_AUDIT_PATH)
+    loader = SkillLoader(
+        SKILLS_DIR,
+        reflexions_store=reflexions,
+        preference_store=preference_store,
+    )
+    lesson_retriever, outcome_tracker, lesson_ingestor, promotion_gate = build_runtime_memory()
+    loop = build_loop(loader, lesson_retriever=lesson_retriever)
+
+    task = resolve_task()
+    if task:
+        print_llm_instances()
+        return run_once(loop, task)
+
+    store = SessionStore(persist_dir=SESSION_DIR)
+    user_facts = UserFacts(USER_FACTS_PATH)
+
+    # 副 LLM evaluator：守 DASHSCOPE_API_KEY，缺失 → None。
+    has_dashscope = bool(os.getenv("DASHSCOPE_API_KEY"))
+
+    evaluator = None
+    if has_dashscope:
+        eval_llm = LLMClient(
+            model=EVALUATOR_MODEL,
+            provider=EVALUATOR_PROVIDER,
+            instance_name="evaluator",
+            timeout=EVALUATOR_TIMEOUT,
+        )
+        evaluator = DigestEvaluator(llm=eval_llm)
+        print(f"[Evaluator] enabled: {EVALUATOR_PROVIDER}/{EVALUATOR_MODEL} "
+              f"(timeout={EVALUATOR_TIMEOUT}s, max_retries={EVALUATOR_MAX_RETRIES})")
+
+    print_llm_instances()
+
+    promotion_audit_callback = (
+        JsonlAuditWriter(PROMOTION_AUDIT_LOG_PATH)
+        if promotion_gate is not None and PROMOTION_AUDIT_LOG_PATH
+        else None
+    )
+
+    preference_distiller = build_preference_distiller(preference_store, preference_audit)
+    if preference_distiller is not None:
+        print(
+            f"[PreferenceDistiller] enabled: {DISTILLER_PROVIDER}/{DISTILLER_MODEL} "
+            f"(min_turns={DISTILLER_MIN_TURNS}, debounce={DISTILLER_DEBOUNCE_MIN}min)"
+        )
+
+    harness = Harness(
+        loop=loop,
+        store=store,
+        loader=loader,
+        user_facts=user_facts,
+        session_key=CLI_SESSION_KEY,
+        base_identity=BASE_IDENTITY,
+        evaluator=evaluator,
+        evaluator_max_retries=EVALUATOR_MAX_RETRIES,
+        outcome_tracker=outcome_tracker,
+        lesson_ingestor=lesson_ingestor,
+        promotion_gate=promotion_gate,
+        promotion_audit_callback=promotion_audit_callback,
+        reflexions_store=reflexions,
+        preference_distiller=preference_distiller,
+        preference_store=preference_store,
+    )
+    return repl(harness)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
