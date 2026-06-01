@@ -1,0 +1,41 @@
+{
+  "skill": "ai-digest",
+  "name": "fetch_x_topic",
+  "description": "按 topic 搜 X 最近推文（补漏用，不作主入口）。query 必填且应为精确 boolean/operator 查询——第三方研究表明 X 信息流是'人驱动'而非'关键词驱动'，优先用 fetch_x_curated / fetch_x_users，本 script 用于覆盖 curated 列表之外的高信号讨论。需要 X_BEARER_TOKEN。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "必填。X search 语法的精确查询，支持 from:user / OR / AND / -is:retweet / lang:en 等。例：'(from:OpenAI OR from:AnthropicAI) (agent OR eval) -is:retweet lang:en'"
+      },
+      "since_time": {
+        "type": "string",
+        "description": "可选：ISO-8601 UTC 时间（如 '2026-04-23T00:00:00Z'）。早于此时间的推文不返回"
+      },
+      "max_results": {
+        "type": "integer",
+        "minimum": 10,
+        "maximum": 100,
+        "default": 20,
+        "description": "返回数量上限。保持较小值以降低噪声召回"
+      }
+    },
+    "required": ["query"]
+  },
+  "examples": [
+    {
+      "title": "搜 Anthropic / OpenAI 近 24h 关于 agent/eval 的原创英文推文",
+      "args": {
+        "query": "(from:AnthropicAI OR from:OpenAI) (agent OR eval) -is:retweet lang:en",
+        "since_time": "2026-04-23T00:00:00Z",
+        "max_results": 20
+      }
+    }
+  ],
+  "notes": [
+    "⚠️ 避免宽泛关键词查询（如 query='AI' 或 'LLM'）——X 噪声太高，宽查询会返回大量营销/情绪讨论",
+    "推荐的 query 模式：(a) from:user 组合 (b) 具体事件词 + 引号短语 (c) 排除 retweet 和非英文",
+    "第三方建议：default 走 fetch_x_curated，fetch_x_topic 只占 X 信号源的 20% 补漏价值"
+  ]
+}

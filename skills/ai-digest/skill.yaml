@@ -1,0 +1,101 @@
+name: ai-digest
+
+# Action contracts (advisor 第二轮裁定 RequiredActionGate)：
+# 用户表达某种意图时产生 obligation；finish 前未满足 → harness inject repair hint。
+#
+# 何时产生 obligation 不依赖 LLM 自己读 SKILL.md，而是 lexical_hints 子串匹配
+# 用户输入。被命中的 obligation 必须由实际 tool call 满足才能 finish。
+action_contracts:
+  - id: mark_digest_when_user_asks_to_record
+    trigger:
+      lexical_hints:
+        - 记下来
+        - 记一下
+        - 标记
+        - 保存
+        - 存一下
+        - 记录
+        - 报过的
+    obligation:
+      tool: skill_exec
+      skill: ai-digest
+      script: dup_check
+      args:
+        action: mark
+    on_missing:
+      mode: repair_once
+      message: |
+        你说"已记录"但实际没有调用 dup_check action=mark 把今日条目写入历史。
+        请用 skill_exec(skill="ai-digest", script="dup_check", args={"action":"mark","items":[...]}) 真实调用，
+        或者在最终回答里明确说明跳过 mark 的理由（例如"今日没有采纳新条目"）。
+
+# Evaluation triggers (advisor 第二轮裁定 evaluator trigger 声明化)：
+# 之前 _DIGEST_MARKERS 硬编码在 harness.py:35，违反 skill-as-plugin。现在
+# trigger 在 skill 自带的 manifest 里，harness 只 dispatch。
+#
+# v0 只支持 on_answer_contains_any（替换原硬编码 markers）。可以容纳 LLM
+# 自由排版（"# 今日 AI 日报" 等不严格匹配模板的写法），用核心关键词短串。
+evaluation:
+  triggers:
+    - on_answer_contains_any:
+        - AI 日报
+        - 论文速览
+        - "## 论文"
+        - "## 开源"
+        - "## 行业"
+
+# Coverage contract (PR 2)：硬覆盖检查的类别 / 阈值 / 计数 regex。
+# 之前在 src/nanoagent/runtime/turn_context.py 顶部 _CATEGORY_MAP / _DEFAULT_THRESHOLDS /
+# _COUNT_RE 三个模块级常量硬编码 ai-digest 业务，违反 framework / skill 边界。
+# 现在装配层（main.py build_loop）扫所有 skill 的 coverage manifest union 合并后注入
+# CoverageChecker。改这里就改 ai-digest 的覆盖标准，不需要改 runtime 代码。
+#
+# 字段：
+# - name: CoverageChecker.counts 的 key（也是 missing_categories 报告里的标签）
+# - threshold: 达标计数门槛
+# - tool / skill / script: 三元组用于 _resolve_category 命中判定
+# - count_pattern: 编译后 regex，第 1 group 是数字字符串。在 tool 输出首条
+#   markdown header（"# ..."）行上 search
+# - suggestion: build_hint 缺类别时显示的修复建议工具名
+coverage:
+  categories:
+    - name: paper
+      threshold: 3
+      tool: skill_exec
+      skill: ai-digest
+      script: fetch_hf
+      count_pattern: '(\d+)\s*篇'
+      suggestion: fetch_hf
+    - name: oss
+      threshold: 2
+      tool: skill_exec
+      skill: ai-digest
+      script: fetch_github
+      count_pattern: '(\d+)\s*个仓库'
+      suggestion: fetch_github
+    - name: news
+      threshold: 1
+      tool: skill_exec
+      skill: ai-digest
+      script: fetch_rss
+      count_pattern: '(\d+)\s*篇'
+      suggestion: fetch_rss
+
+# Archive contract (PR 3)：满足任一 markers 的 answer 触发归档落盘。
+# 之前 _DIGEST_ARCHIVE_MARKERS 6 元组硬编码在 harness.py:36，违反 framework
+# 边界。现在 manifest 化后 harness 只 dispatch。
+#
+# 与 evaluation.triggers 形似但语义不同：evaluation 决定要不要跑 evaluator
+# (LLM 审查质量)；archive 决定要不要把 answer 写到磁盘留底。两者重合的字串
+# 不能合并——markers 集合不严格相同（archive 有"## 论文速览" / evaluation 有
+# "## 论文"）。output_dir 是相对 data_dir 的子路径名。
+archive:
+  enabled: true
+  output_dir: digests
+  answer_contains_any:
+    - "# AI 日报"
+    - "## 论文速览"
+    - "## 开源与工程"
+    - "## 行业动态"
+    - "# 今日 AI 日报"
+    - "## 论文"

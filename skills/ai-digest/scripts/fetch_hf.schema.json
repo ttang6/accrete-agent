@@ -1,0 +1,29 @@
+{
+  "skill": "ai-digest",
+  "name": "fetch_hf",
+  "description": "拉取 Hugging Face 今日精选论文（由 HF 编辑人工筛选，含 upvotes 热度）。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "max_results": {
+        "type": "integer",
+        "description": "返回论文数量，默认 10，上限 20",
+        "default": 10,
+        "maximum": 20
+      },
+      "sort": {
+        "type": "string",
+        "enum": ["hot", "rising", "new"],
+        "description": "排序方式。留空使用接口默认"
+      }
+    },
+    "required": []
+  },
+  "examples": [
+    {"title": "默认拉 10 条", "args": {}},
+    {"title": "拉前 5 条、按 hot 排序", "args": {"max_results": 5, "sort": "hot"}}
+  ],
+  "notes": [
+    "args 全部可选，可直接 skill_exec(skill='ai-digest', script='fetch_hf') 不带 args"
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "skill": "ai-digest",
+  "name": "fetch_github",
+  "description": "拉取 GitHub Trending 仓库（HTML 抓取 + 按天缓存）。GitHub 官方无 trending API，走页面抓取是既定做法。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "language": {
+        "type": "string",
+        "description": "编程语言过滤，如 python / typescript。留空 = 所有语言"
+      },
+      "since": {
+        "type": "string",
+        "enum": ["daily", "weekly", "monthly"],
+        "default": "daily",
+        "description": "时间范围"
+      },
+      "max_results": {
+        "type": "integer",
+        "description": "返回仓库数量，默认 10,上限 25",
+        "default": 10,
+        "maximum": 25
+      }
+    },
+    "required": []
+  },
+  "examples": [
+    {"title": "默认拉当日 top 10", "args": {}},
+    {"title": "只拉 Python 项目、本周范围 top 15", "args": {"language": "python", "since": "weekly", "max_results": 15}}
+  ],
+  "notes": [
+    "args 全部可选，可直接 skill_exec(skill='ai-digest', script='fetch_github') 不带 args",
+    "结果按日缓存在 data/cache/github_trending/，当天重复调用走缓存"
+  ]
+}

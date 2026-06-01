@@ -1,0 +1,29 @@
+{
+  "skill": "ai-digest",
+  "name": "fetch_rss",
+  "description": "从 sources.yaml 订阅的 RSS 源拉近 48h 文章，覆盖 Anthropic / DeepMind / OpenAI / HF Blog 等 AI 研究博客。自动去噪、按 guid/link 去重、对 high priority 源并发做全文提取。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "category": {
+        "type": "string",
+        "enum": ["AI Research", "AI Engineering", "Open Source", "Industry News"],
+        "description": "按分类过滤。留空 = 全部"
+      },
+      "max_results": {
+        "type": "integer",
+        "description": "返回文章数量，默认 15，上限 30",
+        "default": 15,
+        "maximum": 30
+      }
+    },
+    "required": []
+  },
+  "examples": [
+    {"title": "默认拉全部分类前 15 条", "args": {}},
+    {"title": "只拉 AI Research 分类前 10 条", "args": {"category": "AI Research", "max_results": 10}}
+  ],
+  "notes": [
+    "args 全部可选，可直接 skill_exec(skill='ai-digest', script='fetch_rss') 不带 args"
+  ]
+}

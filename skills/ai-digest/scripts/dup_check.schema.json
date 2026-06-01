@@ -1,0 +1,59 @@
+{
+  "skill": "ai-digest",
+  "name": "dup_check",
+  "description": "跨批次日报条目去重。两 action：check（查询已报历史）和 mark（写入本次采纳条目到历史）。action 决定其他参数的 shape，与 fetch_* 的差异点在于 args 必填。",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": ["check", "mark"],
+        "description": "必填。check = 查询哪些 fingerprint 已报过；mark = 把本次采纳的条目写入历史"
+      },
+      "fingerprints": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "仅当 action=check 时必填。fingerprint 字符串列表（论文用 arxiv_id、博客/RSS 用完整 URL、GitHub 仓库用 owner/repo）"
+      },
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "fingerprint": {"type": "string", "description": "必填：同 check 的 fingerprint 格式"},
+            "source": {"type": "string", "description": "可选：来源工具名，如 fetch_hf / fetch_rss / fetch_github"},
+            "title": {"type": "string", "description": "可选：条目标题，便于人工审查历史"}
+          },
+          "required": ["fingerprint"]
+        },
+        "description": "仅当 action=mark 时必填。每条至少含 fingerprint 字段"
+      }
+    },
+    "required": ["action"]
+  },
+  "examples": [
+    {
+      "title": "action=check：查询 3 个 fingerprint 是否已报过",
+      "args": {
+        "action": "check",
+        "fingerprints": ["2510.12345", "https://blog.example/post", "owner/repo"]
+      }
+    },
+    {
+      "title": "action=mark：写入本次采纳的 2 个条目",
+      "args": {
+        "action": "mark",
+        "items": [
+          {"fingerprint": "2510.12345", "source": "fetch_hf", "title": "Attention paper"},
+          {"fingerprint": "owner/repo", "source": "fetch_github", "title": "Demo repo"}
+        ]
+      }
+    }
+  ],
+  "notes": [
+    "⚠️ args 必填（无默认 action），与同 skill 下的 fetch_* 不同——fetch_* 省略 args 能跑，dup_check 不能",
+    "action=check 必须配 fingerprints 列表；action=mark 必须配 items 列表",
+    "存储位置 data/memory/digest_reported.jsonl，全局单例跨 channel 共享",
+    "同一 fingerprint 重复 mark 不会重复写入（自动跳过），保留首次 reported_at"
+  ]
+}
