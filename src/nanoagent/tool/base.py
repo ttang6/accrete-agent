@@ -11,6 +11,10 @@ class BaseTool(ABC):
     # 默认 False；只有 schema 已 strict-compliant 的子类（如 SkillExecTool）覆盖为 True。
     strict_mode: bool = False
 
+    # SubAgent 递归 guard 标记：SubAgentTool 覆盖为 True。SubAgentRunner 裁剪
+    # 子 agent registry 时硬剔除带此标记的 tool —— 子 agent 不得再开子 agent。
+    is_subagent: bool = False
+
     @property
     @abstractmethod
     def name(self) -> str: ...
