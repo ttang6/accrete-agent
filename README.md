@@ -42,10 +42,10 @@ src/nanoagent/
 ├ tool/        BaseTool + registry；fetch / search / skill_exec / arxiv / calc ...
 ├ runtime/     主循环（native function-calling，非 ReAct）/ harness / session
 │              + 协议级自主性（coverage / failure-memory / evaluator）
-│              + telegram channel
+│              + 隔离子 agent（SubAgent：受限工具 + context 隔离）+ telegram channel
 ├ skills/      渐进披露的 skill loader（启动只扫 metadata，body 按需 lazy load）
 ├ memory/      UserFacts 用户画像
-├ evolution/   反馈学习飞轮：trace → episode → lesson → 状态机 → 召回注入
+├ evolution/   反馈学习飞轮（trace → lesson → 状态机 → 召回）+ 滚动偏好蒸馏 pipeline
 └ lesson/      lesson 运维 CLI（手动 promote / retire / list）
 
 main.py         CLI 薄壳（装配 + REPL / one-shot）
