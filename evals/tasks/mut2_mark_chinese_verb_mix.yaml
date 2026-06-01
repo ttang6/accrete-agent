@@ -1,0 +1,15 @@
+id: mut2_mark_chinese_verb_mix
+description: 用"收藏归档"等非标准动词混合表达
+query: "今日日报出完之后，把里面的论文和项目都给我收藏归档一下，建个索引"
+expected_obligations:
+  - mark_digest_when_user_asks_to_record
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_github}
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: [paper, oss]
+max_iterations: 35
+success_keywords:
+  - "AI 日报"
+  - "归档"
+expected_failure_type: "b06551e9 / schema_mismatch: '收藏归档' 易让 agent 填 action=archive/save"

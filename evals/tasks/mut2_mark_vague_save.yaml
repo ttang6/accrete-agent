@@ -1,0 +1,14 @@
+id: mut2_mark_vague_save
+description: 模糊"存一下"指令，action 字段易留空
+query: "今天 HF 上那几篇 agent 相关的论文挺有意思的，存一下吧"
+expected_obligations:
+  - mark_digest_when_user_asks_to_record
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: [paper]
+max_iterations: 30
+success_keywords:
+  - "论文"
+  - "已记录"
+expected_failure_type: "b06551e9 / schema_mismatch: dup_check action 字段可能为空或非 check/mark"

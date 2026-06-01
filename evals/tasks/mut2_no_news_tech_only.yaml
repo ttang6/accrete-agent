@@ -1,0 +1,14 @@
+id: mut2_no_news_tech_only
+description: 用户暗示不要新闻类，agent 可能跳过 fetch_rss
+query: "今天日报别夹那些媒体软文了，就给我硬核的：论文 + 开源项目，要技术含量高的"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_github}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_rss}
+expected_coverage: [paper, oss, news]
+max_iterations: 30
+success_keywords:
+  - "AI 日报"
+  - "论文"
+expected_failure_type: "b627da82 / coverage_gap: agent 主动跳过 fetch_rss 致 news=0"

@@ -1,0 +1,21 @@
+id: mt_long_correct_redo_stacking
+description: 修正叠加·多次改主意：用户先要只看论文，改成加 github，又改成去掉某类，再改时间范围，最后一轮才确定范围并 mark。考察：多次约束叠加
+  + agent 不覆盖而是增量修正 + 最终 mark。
+query:
+- 给我看看今天 HF 上的论文就好，其他不用
+- 等等，顺便把 github trending 也加上吧，今天的
+- github 那边算了，太多了，还是只要论文，但是换成最近三天的，不只是今天
+- 三天的有点多，就昨天和今天的就好
+- 好，这些论文里面跟 multimodal 相关的，帮我单独标记出来
+- 还有一篇讲 vision-language alignment 的，刚才有吗，有的话也加进去
+- 行，就这些，全标了吧
+expected_obligations:
+- mark_digest_when_user_asks_to_record
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: dup_check
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+- 已记录

@@ -1,0 +1,14 @@
+id: mut2_no_news_research_focus
+description: 研究向语境，agent 易忽略行业新闻类目
+query: "今天给我做一份偏研究的快报，重点 HF 论文 + 学术圈讨论的 GitHub 实现，能复现的那种"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_github}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_rss}
+expected_coverage: [paper, oss, news]
+max_iterations: 30
+success_keywords:
+  - "论文"
+  - "复现"
+expected_failure_type: "b627da82 / coverage_gap: '研究向' 语境 agent 跳过 news 类目"

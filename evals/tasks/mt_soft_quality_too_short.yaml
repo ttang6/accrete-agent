@@ -1,0 +1,21 @@
+id: mt_soft_quality_too_short
+description: '多轮·软质量迭代：用户要日报，agent 给的摘要太短被嫌弃；
+
+  turn 2 要求加详细方法描述；turn 3 还是嫌缺引用来源，要求补上链接。
+
+  grade 最后一轮——evaluator 期望有来源链接 + 方法段落。
+
+  '
+query:
+- 给我今日 AI 日报
+- 太简略了，每篇论文能不能说说具体方法，不要只有标题
+- 还是差点意思，能不能把原文链接也贴上
+expected_obligations: []
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_hf
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+- arxiv.org

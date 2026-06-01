@@ -1,0 +1,21 @@
+id: mut_soft_quality_too_brief
+description: 用户要"一句话总结"，evaluator 容易判过简
+query: 今天 AI 日报，每条一句话总结就行，越简短越好
+expected_obligations: []
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_hf
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_rss
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_github
+expected_coverage:
+- paper
+- oss
+- news
+max_iterations: 25
+success_keywords:
+- AI 日报

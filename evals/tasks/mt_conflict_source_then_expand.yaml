@@ -1,0 +1,24 @@
+id: mt_conflict_source_then_expand
+description: '多轮·冲突：用户先说"只要 github 不要论文"，agent 按要求执行；
+
+  turn 2 反悔"算了，arxiv 的也加上"，要求前后合并；
+
+  turn 3 说"都收藏了吧，确认一下"。
+
+  考察：前后约束冲突 + agent 合并而非覆盖 + 最终 mark 验证。
+
+  '
+query:
+- 今天只给我 github trending，arxiv 论文先不用
+- 算了算了，把今天 HF 的论文也加进来吧
+- 好，这些都收藏了没，确认一下
+expected_obligations:
+- mark_digest_when_user_asks_to_record
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: dup_check
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+- 已记录

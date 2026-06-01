@@ -1,0 +1,14 @@
+id: mut_schema_topk_unusual
+description: top_k 很大且要分类，容易传错参数结构
+query: 今天 HF papers 给我前 50 篇，按 RL / agent / 多模态 三类分组列出来
+expected_obligations: []
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_hf
+expected_coverage:
+- paper
+max_iterations: 30
+success_keywords:
+- 论文
+- RL

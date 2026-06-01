@@ -1,0 +1,22 @@
+id: mt_correct_redo_time_window
+description: '多轮·修正回滚：用户先要"今天的日报"，看完说"其实我想要昨天的，今天的先不管"，
+
+  agent 需丢弃 turn 1 结果重新 fetch；turn 3 用户说"好，昨天那篇论文收藏一下"。
+
+  考察：时间窗口回滚 + 上下文替换 + 最终 mark。
+
+  '
+query:
+- 出一份今天的 AI 日报
+- 等等，我搞错了，我想看的是昨天的，今天的不用了
+- 行，昨天日报里那篇关于 agent planning 的论文收藏一下
+expected_obligations:
+- mark_digest_when_user_asks_to_record
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: dup_check
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+- 已记录

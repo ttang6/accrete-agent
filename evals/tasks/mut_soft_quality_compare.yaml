@@ -1,0 +1,14 @@
+id: mut_soft_quality_compare
+description: 要求横向对比多个项目，深度容易不够
+query: 今天 trending 上的 agent 框架横向对比一下，star 增速、技术路线差异都说清楚
+expected_obligations: []
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_github
+expected_coverage:
+- oss
+max_iterations: 30
+success_keywords:
+- 对比
+- agent

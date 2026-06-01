@@ -1,0 +1,167 @@
+id: mt_long_drill_down_moe_then_mark
+description: '长链追问·MoE 主题：用户从宽泛问 MoE 进展，每轮追问更深细节，第 5 轮顺口说"记一下"。考察：多轮上下文保持 + 深度追问 + 最后一轮 mark obligation。'
+query:
+  - "最近 MoE 方向有什么新进展，简单说说"
+  - "你提到的那个 expert routing 优化，能展开讲讲吗，怎么降低 load imbalance 的"
+  - "那 token dropping 策略具体是怎么决定哪些 token 不路由的？有没有论文里的实验数据"
+  - "听起来跟 DeepSeek MoE 的思路有点像，他们是一回事吗还是不同方向"
+  - "好的我懂了，这几篇都挺值得看的，帮我记一下"
+expected_obligations:
+  - mark_digest_when_user_asks_to_record
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+  - "已记录"
+expected_failure_type: "前四轮 fetch_hf 正常；turn 5 mark 时若无合规 fp 触发 schema_mismatch；飞轮应在 turn 5 注入 fp=arxiv_id 修复提示"
+expected_pattern: drill_down
+
+---
+id: mt_long_drill_down_agent_eval_then_mark
+description: '长链追问·Agent Evaluation 主题：用户先问 agent eval 框架，连续追问 benchmark 设计、human annotation、自动评分等细节，第 7 轮说"这篇存一下"。考察：超长上下文保持 + 专题追问 + 最末轮 mark。'
+query:
+  - "现在评估 LLM agent 能力有哪些主流 benchmark，你知道哪些"
+  - "AgentBench 和 WebArena 有什么区别，分别测什么"
+  - "WebArena 的 task 是人工标注的还是自动生成的，标注成本怎么控制"
+  - "那自动评分的话，怎么判断 agent 有没有真的完成任务，不是只看最后输出"
+  - "有没有论文专门讲 process reward 在 agent eval 里的应用的"
+  - "你提到那篇 process-level 评估的，是哪篇，arxiv 有吗"
+  - "好，帮我把这篇收藏一下"
+expected_obligations:
+  - mark_digest_when_user_asks_to_record
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+  - "已记录"
+expected_failure_type: "turn 1-6 fetch_hf 上下文积累；turn 7 mark 时 fp 需从对话中解析 arxiv id，若 agent 用标题替代 fp 触发 schema_mismatch；飞轮应提示 fp 必须是 arxiv id"
+expected_pattern: drill_down
+
+---
+id: mt_long_cross_topic_paper_oss_news_mark
+description: '跨主题混合：用户先聊 diffusion model 论文，转话题问相关 OSS 工具，再问行业新闻动态，最后说"刚才这些都标记一下"。考察：跨类目上下文合并 + 混合 mark。'
+query:
+  - "最近 diffusion model 在视频生成上有什么新论文，HF 上有吗"
+  - "那有没有开源的视频生成框架，github 上 star 比较多的那种"
+  - "Wan Video 和 CogVideoX 哪个更活跃，最近有更新吗"
+  - "行业那边呢，最近有哪些公司发布视频生成相关的新闻"
+  - "Sora 那边有没有新消息，还是已经没声音了"
+  - "好，刚才聊到的那几篇论文和两个仓库都帮我标记一下，新闻不用"
+expected_obligations:
+  - mark_digest_when_user_asks_to_record
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+  - "已记录"
+expected_failure_type: "turn 1-5 分别调 fetch_hf / fetch_github / fetch_rss；turn 6 批量 mark paper+oss 时需正确过滤新闻条目，items 里混入 news 则 grader 判 soft_quality_issue；飞轮应提示类目过滤规则"
+expected_pattern: cross_query_mark
+
+---
+id: mt_long_correct_redo_stacking
+description: '修正叠加·多次改主意：用户先要只看论文，改成加 github，又改成去掉某类，再改时间范围，最后一轮才确定范围并 mark。考察：多次约束叠加 + agent 不覆盖而是增量修正 + 最终 mark。'
+query:
+  - "给我看看今天 HF 上的论文就好，其他不用"
+  - "等等，顺便把 github trending 也加上吧，今天的"
+  - "github 那边算了，太多了，还是只要论文，但是换成最近三天的，不只是今天"
+  - "三天的有点多，就昨天和今天的就好"
+  - "好，这些论文里面跟 multimodal 相关的，帮我单独标记出来"
+  - "还有一篇讲 vision-language alignment 的，刚才有吗，有的话也加进去"
+  - "行，就这些，全标了吧"
+expected_obligations:
+  - mark_digest_when_user_asks_to_record
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+  - "已记录"
+expected_failure_type: "turn 1-6 约束频繁变更，agent 若每次重置 context 而非增量修正，mark 时条目集合错误触发 soft_quality_issue；飞轮应提示保留历史约束增量叠加"
+expected_pattern: correct_redo
+
+---
+id: mt_long_failchain_schema_mismatch
+description: '失败长链·连续 schema_mismatch：用户每轮都以不同程度的模糊方式描述要收藏的内容，连续多轮触发缺字段失败，最后一轮给全信息，飞轮应 helped。考察：多轮失败积累 + 飞轮在最终轮注入修复提示。'
+query:
+  - "帮我记一下今天看到的那篇讲 speculative decoding 的"
+  - "就是 HF 上热度比较高的那篇，你应该知道的"
+  - "名字里有 draft 那个词，好像是谷歌出的"
+  - "arxiv 上的，大概是最近一个月内发的"
+  - "行吧，id 是 2502.11157，标题是 Draft Model Knows When to Stop，帮我存上"
+expected_obligations:
+  - mark_digest_when_user_asks_to_record
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+  - "已记录"
+expected_failure_type: "turn 1-4 每轮 dup_check 因缺 fp 触发 schema_mismatch，连续失败入 candidate lessons；turn 5 给完整 arxiv id 后飞轮 hint 应让 agent 直接用 fp=2502.11157 构造合规 args"
+expected_pattern: drill_down
+
+---
+id: mt_long_dup_check_batch_then_mark
+description: 'session 内反复 dup_check check：用户逐条询问"这条记过没"，agent 每轮调 action=check，最后一轮说"没记过的都帮我存上"。考察：check action 多轮累积 + 最末轮批量 mark 未记录条目。'
+query:
+  - "2503.04872 这篇我之前有没有收藏过"
+  - "那 microsoft/phi-4 这个仓库呢，我记得好像存过，确认一下"
+  - "2501.12599 呢，这篇也帮我查查"
+  - "还有 unsloth-ai/unsloth 这个仓库，看看有没有记录"
+  - "2503.04872 和 unsloth 那个是没记过对吧，再确认一下"
+  - "好，没记过的这两个都帮我存上"
+expected_obligations:
+  - mark_digest_when_user_asks_to_record
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+  - "已记录"
+expected_failure_type: "turn 1-5 全是 action=check，turn 6 批量 mark 时 agent 需正确区分已记录与未记录条目，若混入已记录条目触发 soft_quality_issue；飞轮应提示 check 结果与 mark items 的对应逻辑"
+expected_pattern: consistency
+
+---
+id: mt_long_cross_topic_news_deep_then_mark
+description: '跨主题混合·新闻深挖：用户先拉今日新闻，追问某条新闻背景，转问相关论文，再问 OSS 生态，最后把跨三类的收获混合 mark。考察：news→paper→oss 跨类追问 + 来源混合 mark。'
+query:
+  - "今天 AI 圈有什么大新闻，抓几条给我看看"
+  - "你说的 OpenAI 那条，背景是什么，能详细说说吗"
+  - "这个方向有没有学术论文支撑，HF 上有相关的吗"
+  - "那 github 上有没有人已经开始复现或者做相关工具了"
+  - "刚才那篇论文链接贴一下，我要确认是不是同一篇"
+  - "好，那条新闻、那篇论文、还有那个复现仓库，三个都帮我标记"
+expected_obligations:
+  - mark_digest_when_user_asks_to_record
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+  - "已记录"
+expected_failure_type: "turn 1-5 分别调 fetch_rss / fetch_hf / fetch_github；turn 6 三类混合 mark 时 items 结构各异（news 无 arxiv fp，oss 用 url），若 agent 统一用 arxiv fp 格式则 schema_mismatch；飞轮应提示不同类目 fp 格式区别"
+expected_pattern: cross_query_mark
+
+---
+id: mt_long_correct_redo_coverage_rebuild
+description: '修正叠加·coverage 重建：用户先砍掉新闻只要 paper+oss，然后说新闻也要，然后又限定只要某个 RSS 来源的新闻，最后确认 coverage 满足后 mark。考察：coverage 约束动态增删 + 来源过滤 + 最终合规 mark。'
+query:
+  - "出个日报，paper 和 github 仓库各来几条"
+  - "感觉少了点，加上新闻吧，各个来源都来一点"
+  - "新闻太杂了，只要 MIT Technology Review 的就好"
+  - "MIT 那边今天有几条，够不够，不够的话多拉一点"
+  - "paper 那边能不能再多来两篇，感觉三篇不太够"
+  - "好了，够了，github 的仓库和 paper 都帮我标记，新闻不用"
+  - "等等，把刚才 MIT 那条关于 AI safety 的新闻也加进去一起标了"
+expected_obligations:
+  - mark_digest_when_user_asks_to_record
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+  - "已记录"
+expected_failure_type: "turn 1-6 coverage 约束多次变更，turn 6 mark 排除新闻后 turn 7 又追加单条新闻；agent 若 turn 7 未补调 dup_check mark 则 obligation violation；飞轮应提示追加条目需补 mark 操作"
+expected_pattern: correct_redo

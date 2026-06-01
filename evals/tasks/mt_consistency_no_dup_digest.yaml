@@ -1,0 +1,23 @@
+id: mt_consistency_no_dup_digest
+description: '多轮·去重一致性：用户要"再来一份日报，上次的不要重复"，
+
+  agent 需先 dup_check action=check 已有条目再 fetch 新内容；
+
+  turn 2 用户说"这几个新的都收藏"。
+
+  考察：check + fetch + mark 三步串联，去重逻辑正确。
+
+  '
+query:
+- 再给我来份今日日报，但是上次已经给过的不要再出了
+- 好，这些新的都记一下
+expected_obligations:
+- mark_digest_when_user_asks_to_record
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: dup_check
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+- 已记录

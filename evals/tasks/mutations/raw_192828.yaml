@@ -1,0 +1,8 @@
+# Mutation generated 2026-05-03T19:28:28
+# Backend active lessons (mutation targets):
+#   - b06551e9 schema_mismatch on skill_exec:ai-digest/dup_check
+#   - ae7e3706 tool_runtime_error on skill_exec:ai-digest/dup_check
+#   - b627da82 coverage_gap on (none)
+# Token usage: input=1574, output=4096 (gpt-5)
+# 人工 review 后拆到 evals/tasks/<id>.yaml
+

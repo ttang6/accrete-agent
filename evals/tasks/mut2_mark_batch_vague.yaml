@@ -1,0 +1,16 @@
+id: mut2_mark_batch_vague
+description: 批量"全标了"，无具体 item 上下文
+query: "把今天日报里所有内容全给我标记上，一个不落，全部进历史库"
+expected_obligations:
+  - mark_digest_when_user_asks_to_record
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_rss}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_github}
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: [paper, oss, news]
+max_iterations: 40
+success_keywords:
+  - "AI 日报"
+  - "已标记"
+expected_failure_type: "ae7e3706 / tool_runtime_error: agent 可能用 title/index 拼 items 漏 fingerprint"

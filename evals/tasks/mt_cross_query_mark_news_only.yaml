@@ -1,0 +1,22 @@
+id: mt_cross_query_mark_news_only
+description: '多轮·跨轮收藏：turn 1 出日报含多条新闻，turn 2 让 agent 收藏新闻里某家来源的条目，
+
+  turn 3 用户确认数量是否对。grade 最后一轮（确认时如发现漏 mark 需补调 dup_check）。
+
+  考察：来源过滤 + 跨轮引用 + 数量核对。
+
+  '
+query:
+- 来一份今天的日报，新闻多抓几条
+- 把里面 The Verge 的那几条新闻标记一下
+- 刚才标了几条？有没有漏的，再确认一次
+expected_obligations:
+- mark_digest_when_user_asks_to_record
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: dup_check
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+- 已记录

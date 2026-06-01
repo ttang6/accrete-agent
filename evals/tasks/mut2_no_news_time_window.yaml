@@ -1,0 +1,14 @@
+id: mut2_no_news_time_window
+description: 极短时间窗，news RSS 大概率为空
+query: "给我看看最近一小时内 HF 新发的论文和 GitHub 新冒头的 trending 项目"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_github}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_rss}
+expected_coverage: [paper, oss, news]
+max_iterations: 30
+success_keywords:
+  - "论文"
+  - "仓库"
+expected_failure_type: "b627da82 / coverage_gap: 1 小时窗口 news=0 触发 coverage missing"

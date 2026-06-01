@@ -1,0 +1,21 @@
+id: mut_coverage_topic_narrow
+description: 主题太窄，三维度都不容易凑齐
+query: 今天关于 diffusion policy 在机器人方向的最新进展，论文 仓库 新闻都给我看下
+expected_obligations: []
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_hf
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_github
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_rss
+expected_coverage:
+- paper
+- oss
+- news
+max_iterations: 30
+success_keywords:
+- diffusion

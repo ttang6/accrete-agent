@@ -1,0 +1,21 @@
+id: mut_coverage_yesterday
+description: 问昨天的，源不一定有缓存
+query: 昨天的 AI 日报补一份，论文 仓库 新闻都要
+expected_obligations: []
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_hf
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_rss
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_github
+expected_coverage:
+- paper
+- oss
+- news
+max_iterations: 30
+success_keywords:
+- AI 日报

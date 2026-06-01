@@ -1,0 +1,12 @@
+id: mut2_mark_screenshot_style
+description: 用户描述但没给链接，要求标记
+query: "把今天那篇讲 RAG 长上下文压缩的论文和那个新出的 agent 框架仓库都记下来，避免明天再出现"
+expected_obligations:
+  - mark_digest_when_user_asks_to_record
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: []
+max_iterations: 30
+success_keywords:
+  - "已记录"
+expected_failure_type: "ae7e3706 / tool_runtime_error: 无 url/arxiv_id, agent 可能漏 fingerprint"

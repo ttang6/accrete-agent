@@ -1,0 +1,14 @@
+id: mut2_mark_ambiguous_followup
+description: 上下文继承式"记下来"，无明确动作语义
+query: "刚才那批 trending 仓库不错，麻烦处理一下，下次别再给我推一样的了"
+expected_obligations:
+  - mark_digest_when_user_asks_to_record
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_github}
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: [oss]
+max_iterations: 30
+success_keywords:
+  - "仓库"
+  - "去重"
+expected_failure_type: "b06551e9 / schema_mismatch: agent 可能填 action=record/save/dedup 等非法值"

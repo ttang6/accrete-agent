@@ -1,0 +1,19 @@
+id: mut_conflict_dedup_but_show_old
+description: 既要去重又要列历史已推过的对比
+query: 出今天日报，把历史推过的也并排列一下做对比，别重复但要看到差异
+expected_obligations: []
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: dup_check
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_hf
+expected_coverage:
+- paper
+- oss
+- news
+max_iterations: 30
+success_keywords:
+- AI 日报
+- 对比

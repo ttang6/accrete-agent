@@ -1,0 +1,12 @@
+id: mut2_mark_titles_only
+description: 用户口头列标题让标记，无 url/id 信息
+query: "记一下今天聊到的这几个：'Self-Rewarding LM'、'Agent Memory Survey'、还有那个 multi-agent benchmark，下次别重复推"
+expected_obligations:
+  - mark_digest_when_user_asks_to_record
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: []
+max_iterations: 30
+success_keywords:
+  - "已标记"
+expected_failure_type: "ae7e3706 / tool_runtime_error: items 仅含 title 缺 fingerprint"

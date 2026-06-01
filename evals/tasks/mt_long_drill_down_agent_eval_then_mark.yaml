@@ -1,0 +1,21 @@
+id: mt_long_drill_down_agent_eval_then_mark
+description: 长链追问·Agent Evaluation 主题：用户先问 agent eval 框架，连续追问 benchmark 设计、human annotation、自动评分等细节，第
+  7 轮说"这篇存一下"。考察：超长上下文保持 + 专题追问 + 最末轮 mark。
+query:
+- 现在评估 LLM agent 能力有哪些主流 benchmark，你知道哪些
+- AgentBench 和 WebArena 有什么区别，分别测什么
+- WebArena 的 task 是人工标注的还是自动生成的，标注成本怎么控制
+- 那自动评分的话，怎么判断 agent 有没有真的完成任务，不是只看最后输出
+- 有没有论文专门讲 process reward 在 agent eval 里的应用的
+- 你提到那篇 process-level 评估的，是哪篇，arxiv 有吗
+- 好，帮我把这篇收藏一下
+expected_obligations:
+- mark_digest_when_user_asks_to_record
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: dup_check
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+- 已记录

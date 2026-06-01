@@ -1,0 +1,16 @@
+id: mut_schema_date_range
+description: 用户给了奇怪日期格式，dup_check 可能 schema 不匹配
+query: 把 7 月 1 号到现在所有 HF 上引用最高的 agent 论文整理一份，已经看过的别再列了
+expected_obligations: []
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_hf
+- tool: skill_exec
+  skill: ai-digest
+  script: dup_check
+expected_coverage:
+- paper
+max_iterations: 30
+success_keywords:
+- 论文

@@ -1,0 +1,383 @@
+id: mut_schema_lang_filter_zh
+description: 用模糊语言要求过滤，可能导致 args 字段错误
+query: "帮我看下 github trending 上中文项目有哪些 AI 的，按热度"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_github}
+expected_coverage: [oss]
+max_iterations: 25
+success_keywords:
+  - "github"
+  - "trending"
+expected_failure_type: schema_mismatch
+
+---
+id: mut_schema_date_range
+description: 用户给了奇怪日期格式，dup_check 可能 schema 不匹配
+query: "把 7 月 1 号到现在所有 HF 上引用最高的 agent 论文整理一份，已经看过的别再列了"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: [paper]
+max_iterations: 30
+success_keywords:
+  - "论文"
+expected_failure_type: schema_mismatch
+
+---
+id: mut_schema_topk_unusual
+description: top_k 很大且要分类，容易传错参数结构
+query: "今天 HF papers 给我前 50 篇，按 RL / agent / 多模态 三类分组列出来"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+expected_coverage: [paper]
+max_iterations: 30
+success_keywords:
+  - "论文"
+  - "RL"
+expected_failure_type: schema_mismatch
+
+---
+id: mut_repeated_rss_source
+description: 指定一个不存在的源，agent 可能反复同样调用
+query: "拉一下 The Information 今天的 AI 新闻，重点看融资和大模型公司动态"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_rss}
+expected_coverage: [news]
+max_iterations: 30
+success_keywords:
+  - "新闻"
+expected_failure_type: repeated_same_args_failure
+
+---
+id: mut_repeated_paper_id
+description: 用户给了具体 paper id，agent 反复用同 args 找不到
+query: "帮我看下 arxiv 2501.12345 这篇论文今天有没有相关讨论或者后续工作"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+expected_coverage: [paper]
+max_iterations: 30
+success_keywords:
+  - "论文"
+expected_failure_type: repeated_same_args_failure
+
+---
+id: mut_repeated_github_org
+description: 指定 org 过滤，工具不支持但 agent 一直试
+query: "看下 openai 和 anthropic 这俩组织今天在 github 上有啥新动作"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_github}
+expected_coverage: [oss]
+max_iterations: 30
+success_keywords:
+  - "github"
+expected_failure_type: repeated_same_args_failure
+
+---
+id: mut_coverage_only_news
+description: 用户只问新闻但要求"完整日报"，coverage 不达标
+query: "今天 AI 圈有啥大新闻？给我整一份完整的日报形式"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_rss}
+expected_coverage: [paper, oss, news]
+max_iterations: 25
+success_keywords:
+  - "AI 日报"
+  - "## 论文"
+  - "## 开源"
+expected_failure_type: coverage_gap
+
+---
+id: mut_coverage_minimal_query
+description: 极简 query，agent 容易只跑一两个维度
+query: "今天有啥"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_rss}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_github}
+expected_coverage: [paper, oss, news]
+max_iterations: 25
+success_keywords:
+  - "AI 日报"
+expected_failure_type: coverage_gap
+
+---
+id: mut_coverage_topic_narrow
+description: 主题太窄，三维度都不容易凑齐
+query: "今天关于 diffusion policy 在机器人方向的最新进展，论文 仓库 新闻都给我看下"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_github}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_rss}
+expected_coverage: [paper, oss, news]
+max_iterations: 30
+success_keywords:
+  - "diffusion"
+expected_failure_type: coverage_gap
+
+---
+id: mut_soft_quality_too_brief
+description: 用户要"一句话总结"，evaluator 容易判过简
+query: "今天 AI 日报，每条一句话总结就行，越简短越好"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_rss}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_github}
+expected_coverage: [paper, oss, news]
+max_iterations: 25
+success_keywords:
+  - "AI 日报"
+expected_failure_type: soft_quality_issue
+
+---
+id: mut_soft_quality_chinese_only
+description: 要求只用中文摘要英文论文，质量容易低
+query: "今日 HF 论文给我整理 5 篇，标题摘要全部翻译成中文，专业术语别保留英文"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+expected_coverage: [paper]
+max_iterations: 25
+success_keywords:
+  - "论文"
+expected_failure_type: soft_quality_issue
+
+---
+id: mut_soft_quality_compare
+description: 要求横向对比多个项目，深度容易不够
+query: "今天 trending 上的 agent 框架横向对比一下，star 增速、技术路线差异都说清楚"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_github}
+expected_coverage: [oss]
+max_iterations: 30
+success_keywords:
+  - "对比"
+  - "agent"
+expected_failure_type: soft_quality_issue
+
+---
+id: mut_runtime_hf_down
+description: HF 不稳时仍强行要论文
+query: "HF papers 今天的全量给我，包括没上首页的"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+expected_coverage: [paper]
+max_iterations: 25
+success_keywords:
+  - "论文"
+expected_failure_type: tool_runtime_error
+
+---
+id: mut_runtime_rss_timeout
+description: 指定多个慢源，rss 超时
+query: "把 techcrunch、theverge、arstechnica、wired 今天的 AI 相关全拉过来"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_rss}
+expected_coverage: [news]
+max_iterations: 25
+success_keywords:
+  - "新闻"
+expected_failure_type: tool_runtime_error
+
+---
+id: mut_runtime_github_rate
+description: 短时间多次拉 github 容易 rate limit
+query: "github trending Python / TypeScript / Rust 三个语言分别给我前 10，全都列出来"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_github}
+expected_coverage: [oss]
+max_iterations: 30
+success_keywords:
+  - "Python"
+  - "Rust"
+expected_failure_type: tool_runtime_error
+
+---
+id: mut_obligation_implicit_save
+description: "存一份"是隐式 mark 触发
+query: "今日日报正常出，最后存一份到历史里，以后看过的就别再推了"
+expected_obligations:
+  - mark_digest_when_user_asks_to_record
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: [paper, oss, news]
+max_iterations: 30
+success_keywords:
+  - "AI 日报"
+expected_failure_type: obligation_miss
+
+---
+id: mut_obligation_archive
+description: 用"归档"代替"记下来"，agent 容易漏 mark
+query: "出完日报顺手归档一下今天的内容，别下次又出现一样的"
+expected_obligations:
+  - mark_digest_when_user_asks_to_record
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: [paper, oss, news]
+max_iterations: 30
+success_keywords:
+  - "AI 日报"
+expected_failure_type: obligation_miss
+
+---
+id: mut_obligation_only_papers_mark
+description: 只标记论文部分，容易漏 mark 或全标
+query: "今日日报全要，但只把论文部分记一下，仓库新闻不用记"
+expected_obligations:
+  - mark_digest_when_user_asks_to_record
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: [paper, oss, news]
+max_iterations: 30
+success_keywords:
+  - "AI 日报"
+  - "## 论文"
+expected_failure_type: obligation_miss
+
+---
+id: mut_conflict_brief_but_full
+description: 既要简短又要全维度，存在冲突
+query: "今日日报论文仓库新闻都要，但是总长度别超过 200 字"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_rss}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_github}
+expected_coverage: [paper, oss, news]
+max_iterations: 25
+success_keywords:
+  - "AI 日报"
+expected_failure_type: multi_constraint_conflict
+
+---
+id: mut_conflict_no_dup_no_mark
+description: 要求去重但不让 mark，逻辑冲突
+query: "出今日日报，跟之前看过的去重，但不要往历史里写新东西"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+expected_coverage: [paper, oss, news]
+max_iterations: 30
+success_keywords:
+  - "AI 日报"
+expected_failure_type: multi_constraint_conflict
+
+---
+id: mut_schema_filter_keywords
+description: 给一堆关键词当过滤器，参数格式易错
+query: "HF 论文里筛 RLHF、DPO、reward model、process reward 这几个关键词相关的，今天的"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+expected_coverage: [paper]
+max_iterations: 25
+success_keywords:
+  - "论文"
+expected_failure_type: schema_mismatch
+
+---
+id: mut_repeated_empty_result
+description: 冷门方向反复拉空
+query: "今天有没有 neuromorphic 相关的 AI 论文或者开源项目"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_github}
+expected_coverage: [paper, oss]
+max_iterations: 30
+success_keywords:
+  - "neuromorphic"
+expected_failure_type: repeated_same_args_failure
+
+---
+id: mut_coverage_yesterday
+description: 问昨天的，源不一定有缓存
+query: "昨天的 AI 日报补一份，论文 仓库 新闻都要"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_rss}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_github}
+expected_coverage: [paper, oss, news]
+max_iterations: 30
+success_keywords:
+  - "AI 日报"
+expected_failure_type: coverage_gap
+
+---
+id: mut_soft_quality_no_link
+description: 不让带链接，evaluator 可能判信息密度低
+query: "今日日报别贴链接，干净文字版给我，每条说清楚是啥就行"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_rss}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_github}
+expected_coverage: [paper, oss, news]
+max_iterations: 25
+success_keywords:
+  - "AI 日报"
+expected_failure_type: soft_quality_issue
+
+---
+id: mut_runtime_mixed_sources
+description: 多工具串联中某个工具挂掉
+query: "今日日报全套，再额外把和 robotics 沾边的单独拎一节出来"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_rss}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_github}
+expected_coverage: [paper, oss, news]
+max_iterations: 30
+success_keywords:
+  - "AI 日报"
+  - "robotics"
+expected_failure_type: tool_runtime_error
+
+---
+id: mut_obligation_followup_mark
+description: 第二轮才说记下来，对短期记忆是考验
+query: "刚才那份日报里 RL 相关的几条标记一下，以后这几个不用重复推了"
+expected_obligations:
+  - mark_digest_when_user_asks_to_record
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+  - "标记"
+expected_failure_type: obligation_miss
+
+---
+id: mut_conflict_dedup_but_show_old
+description: 既要去重又要列历史已推过的对比
+query: "出今天日报，把历史推过的也并排列一下做对比，别重复但要看到差异"
+expected_obligations: []
+expected_tool_calls:
+  - {tool: skill_exec, skill: ai-digest, script: dup_check}
+  - {tool: skill_exec, skill: ai-digest, script: fetch_hf}
+expected_coverage: [paper, oss, news]
+max_iterations: 30
+success_keywords:
+  - "AI 日报"
+  - "对比"
+expected_failure_type: multi_constraint_conflict

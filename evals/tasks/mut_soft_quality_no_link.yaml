@@ -1,0 +1,21 @@
+id: mut_soft_quality_no_link
+description: 不让带链接，evaluator 可能判信息密度低
+query: 今日日报别贴链接，干净文字版给我，每条说清楚是啥就行
+expected_obligations: []
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_hf
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_rss
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_github
+expected_coverage:
+- paper
+- oss
+- news
+max_iterations: 25
+success_keywords:
+- AI 日报

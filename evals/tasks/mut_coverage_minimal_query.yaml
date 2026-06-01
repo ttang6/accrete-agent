@@ -1,0 +1,21 @@
+id: mut_coverage_minimal_query
+description: 极简 query，agent 容易只跑一两个维度
+query: 今天有啥
+expected_obligations: []
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_hf
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_rss
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_github
+expected_coverage:
+- paper
+- oss
+- news
+max_iterations: 25
+success_keywords:
+- AI 日报

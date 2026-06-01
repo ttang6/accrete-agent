@@ -1,0 +1,21 @@
+id: mt_cross_query_mark_github_subset
+description: '多轮·跨轮收藏：先出完整日报（paper+oss+news），再让 agent 只 mark 其中 github 仓库。
+
+  考察：reference resolution（"刚才出的"）+ 类型过滤 + ObligationTracker 仅对 oss 子集触发。
+
+  grade 最后一轮——决定性步骤（mark oss items）在 turn 2。
+
+  '
+query:
+- 帮我出个今日日报，paper、github 仓库、新闻都要
+- 好的，把刚才里面那几个 github 仓库都收藏一下，论文和新闻不用
+expected_obligations:
+- mark_digest_when_user_asks_to_record
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: dup_check
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+- 已记录

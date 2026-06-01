@@ -1,0 +1,17 @@
+id: mut_coverage_only_news
+description: 用户只问新闻但要求"完整日报"，coverage 不达标
+query: 今天 AI 圈有啥大新闻？给我整一份完整的日报形式
+expected_obligations: []
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_rss
+expected_coverage:
+- paper
+- oss
+- news
+max_iterations: 25
+success_keywords:
+- AI 日报
+- '## 论文'
+- '## 开源'

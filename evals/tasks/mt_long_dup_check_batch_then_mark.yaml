@@ -1,0 +1,20 @@
+id: mt_long_dup_check_batch_then_mark
+description: session 内反复 dup_check check：用户逐条询问"这条记过没"，agent 每轮调 action=check，最后一轮说"没记过的都帮我存上"。考察：check
+  action 多轮累积 + 最末轮批量 mark 未记录条目。
+query:
+- 2503.04872 这篇我之前有没有收藏过
+- 那 microsoft/phi-4 这个仓库呢，我记得好像存过，确认一下
+- 2501.12599 呢，这篇也帮我查查
+- 还有 unsloth-ai/unsloth 这个仓库，看看有没有记录
+- 2503.04872 和 unsloth 那个是没记过对吧，再确认一下
+- 好，没记过的这两个都帮我存上
+expected_obligations:
+- mark_digest_when_user_asks_to_record
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: dup_check
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+- 已记录

@@ -1,0 +1,22 @@
+id: mut_runtime_mixed_sources
+description: 多工具串联中某个工具挂掉
+query: 今日日报全套，再额外把和 robotics 沾边的单独拎一节出来
+expected_obligations: []
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_hf
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_rss
+- tool: skill_exec
+  skill: ai-digest
+  script: fetch_github
+expected_coverage:
+- paper
+- oss
+- news
+max_iterations: 30
+success_keywords:
+- AI 日报
+- robotics

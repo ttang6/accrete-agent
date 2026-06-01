@@ -1,0 +1,20 @@
+id: mt_long_cross_topic_paper_oss_news_mark
+description: 跨主题混合：用户先聊 diffusion model 论文，转话题问相关 OSS 工具，再问行业新闻动态，最后说"刚才这些都标记一下"。考察：跨类目上下文合并
+  + 混合 mark。
+query:
+- 最近 diffusion model 在视频生成上有什么新论文，HF 上有吗
+- 那有没有开源的视频生成框架，github 上 star 比较多的那种
+- Wan Video 和 CogVideoX 哪个更活跃，最近有更新吗
+- 行业那边呢，最近有哪些公司发布视频生成相关的新闻
+- Sora 那边有没有新消息，还是已经没声音了
+- 好，刚才聊到的那几篇论文和两个仓库都帮我标记一下，新闻不用
+expected_obligations:
+- mark_digest_when_user_asks_to_record
+expected_tool_calls:
+- tool: skill_exec
+  skill: ai-digest
+  script: dup_check
+expected_coverage: []
+max_iterations: 25
+success_keywords:
+- 已记录
