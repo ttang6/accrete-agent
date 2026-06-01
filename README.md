@@ -2,8 +2,6 @@
 
 > 超轻量、带**反馈学习**能力的 agent 框架 —— LLM 全权决策的 tool-use 主循环 + 从失败 trace 自动学习的 lesson 飞轮，并附一个完整的 AI 日报 Telegram Bot 作为 reference implementation。
 
-哲学对齐 [HKUDS/nanobot](https://github.com/HKUDS/nanobot)：kernel 尽量薄，能力靠 tool / skill 渐进披露挂载，而不是堆抽象。
-
 ## 差异化
 
 - **反馈学习**：agent 跑失败 → trace 自动抽成 lesson → 状态机筛选 → 下次同类失败时召回注入。整条飞轮无 LLM consolidator、不依赖 DSPy/GEPA，纯规则驱动。
