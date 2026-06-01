@@ -13,6 +13,7 @@ from nanoagent.memory.user_facts import UserFacts
 from nanoagent.runtime.evaluator import DigestEvaluator
 from nanoagent.runtime.main_loop import MainLoop
 from nanoagent.runtime.session import SessionStore
+from nanoagent.runtime.token_counter import TokenCounter
 from nanoagent.skills.loader import SkillLoader
 
 if TYPE_CHECKING:
@@ -44,6 +45,11 @@ _TITLE_MAX_CHARS = 50
 # 其他 channel（如 Telegram）通过构造参数 `session_key_prefix` 覆盖，
 # 例如 `tg:<chat_id>:`，最终 key 形如 `tg:<chat_id>:<uuid8>`。
 _DEFAULT_SESSION_PREFIX = "cli:"
+
+# Session 级上下文体量软告警阈值（token）。历史滚到此值以上，每个 session
+# 首次越过时在回复末尾附一句"建议 /new"。只量+提醒，不自动截断历史
+# （硬底线仍是 HistoryManager.max_messages 按条数）。0 = 关闭软告警。
+_SESSION_HISTORY_WARN_TOKENS_DEFAULT = 60_000
 
 
 @dataclass
@@ -93,6 +99,7 @@ class Harness:
         reflexions_store: Optional["ReflexionStore"] = None,
         preference_distiller: Optional["PreferenceDistiller"] = None,
         preference_store: Optional["SkillPreferenceStore"] = None,
+        session_history_warn_tokens: int = _SESSION_HISTORY_WARN_TOKENS_DEFAULT,
     ):
         self._loop = loop
         self._store = store
@@ -125,6 +132,10 @@ class Harness:
         # 装配时未注入 → 全套 hook 静默跳过（向后兼容）。
         self._preference_distiller = preference_distiller
         self._preference_store = preference_store
+        # Session 级 context budget（最小版，对齐 nanobot：只量+提醒、不自动截断）。
+        # Harness 自持一份 TokenCounter（谁用谁持），不伸手进 MainLoop 的内部字段。
+        self._token_counter = TokenCounter()
+        self._session_history_warn_tokens = session_history_warn_tokens
         self._current_skill = self._load_current_skill()
         # 启动后第一条对话消息默认开新 session——避免无意识续上次。
         # /resume / /new / /clear 任一显式动作都会把它置 False。
@@ -555,6 +566,11 @@ class Harness:
         # loop 行为完全不变（向后兼容）。
         pending_contracts = self._collect_matched_action_contracts(text)
 
+        # Session 记账基准：本轮跑前快照累计用量，turn 结束算 delta。
+        # run_bot 多 chat 共享同一 llm 实例，但单 worker 串行执行 → 本轮"前→后"
+        # 差值仍只反映本轮（不被其他 chat 干扰）。
+        usage_before = self._loop.llm.usage.snapshot()
+
         defer_save = self._evaluator is not None
         answer = self._loop.run(
             messages=turn_messages,
@@ -576,19 +592,29 @@ class Harness:
         self._maybe_run_promotion_gate()
 
         self._store.append_turn(self._session_key, text, answer)
-        self._update_session_meta_after_turn(text)
+        token_delta = self._loop.llm.usage.total_tokens - usage_before.total_tokens
+        notice = self._update_session_meta_after_turn(text, token_delta)
         self._maybe_archive_digest(answer)
+        content = answer if notice is None else f"{answer}\n\n{notice}"
         return HarnessResponse(
             kind="assistant",
-            content=answer,
+            content=content,
             skill=self._current_skill,
             usage=str(self._loop.llm.usage),
         )
 
-    def _update_session_meta_after_turn(self, user_text: str) -> None:
-        """每 turn 结束更新 session.meta：title 首次写入、last_used_at 每次刷新。"""
+    def _update_session_meta_after_turn(self, user_text: str, token_delta: int) -> Optional[str]:
+        """每 turn 结束更新 session.meta，并返回可选的"会话过长"软提示。
+
+        三类更新合并到一次 set_meta（一次落盘）：
+        - title 首次写入、last_used_at 每次刷新（原有逻辑）
+        - session_tokens 累计用量：{total, turns}，跨重启持久（用量记账）
+        - 上下文体量软告警：历史 token 体量首次越过阈值 → 标记 warned 并返回提示串。
+          只量+提醒，不截断历史（硬底线仍是 HistoryManager.max_messages）。
+        返回 None 表示本轮无提示。
+        """
         existing = self._store.get_meta(self._session_key)
-        updates: dict[str, Optional[str]] = {
+        updates: dict[str, object] = {
             "last_used_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
         if not existing.get("title"):
@@ -596,7 +622,31 @@ class Harness:
             if len(title) > _TITLE_MAX_CHARS:
                 title = title[:_TITLE_MAX_CHARS - 1] + "…"
             updates["title"] = title
+
+        # 累计本 session token 用量（shallow-copy 后改，不动 store 里的原对象）
+        acc = dict(existing.get("session_tokens") or {})
+        acc["total"] = int(acc.get("total", 0)) + max(0, token_delta)
+        acc["turns"] = int(acc.get("turns", 0)) + 1
+
+        # 软告警：估当前历史体量，首次越过阈值发一次提示（warned 标志去重）
+        notice: Optional[str] = None
+        if self._session_history_warn_tokens > 0 and not acc.get("warned"):
+            history = self._store.get(self._session_key)
+            hist_tokens = (
+                self._token_counter.count_messages(history.get_history())
+                if history is not None else 0
+            )
+            if hist_tokens >= self._session_history_warn_tokens:
+                acc["warned"] = True
+                _logger.info(
+                    f"[session-budget] {self._session_key} 历史 ~{hist_tokens} tokens "
+                    f"≥ 阈值 {self._session_history_warn_tokens}，建议开新会话"
+                )
+                notice = "（本会话已较长，建议 /new 开新会话以保持响应质量）"
+
+        updates["session_tokens"] = acc
         self._store.set_meta(self._session_key, **updates)
+        return notice
 
     def _maybe_ingest_trace(self) -> None:
         """Trigger LessonIngestor on the just-finalized trace; fail-open."""

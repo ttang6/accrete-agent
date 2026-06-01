@@ -127,6 +127,10 @@ TOOL_OUTPUT_MAX_SINGLE_TOKENS: int = 2_000
 TOOL_OUTPUT_MAX_TOTAL_TOKENS: int = 12_000
 TOOL_OUTPUTS_DIR_NAME: str = "tool_outputs"
 
+# Session 级上下文体量软告警阈值（token）。历史滚到此值以上，每个 session 首次
+# 越过时在回复末尾附一句"建议 /new"。只量+提醒、不自动截断历史。0 = 关闭。
+SESSION_HISTORY_WARN_TOKENS: int = 60_000
+
 BASE_IDENTITY: str = """# Role
 你是一个具备高度自主权与逻辑分析能力的智能 Agent 核心。通过精准的逻辑推理和工具调用，高效、闭环地解决用户问题。
 
@@ -488,6 +492,7 @@ def main() -> int:
         reflexions_store=reflexions,
         preference_distiller=preference_distiller,
         preference_store=preference_store,
+        session_history_warn_tokens=SESSION_HISTORY_WARN_TOKENS,
     )
     return repl(harness)
 
