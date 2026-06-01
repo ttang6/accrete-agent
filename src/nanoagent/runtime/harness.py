@@ -17,7 +17,7 @@ from nanoagent.runtime.token_counter import TokenCounter
 from nanoagent.skills.loader import SkillLoader
 
 if TYPE_CHECKING:
-    from nanoagent.evolution.preference_distiller import PreferenceDistiller
+    from nanoagent.evolution.preference_pipeline.pipeline import PreferenceDistillPipeline
     from nanoagent.evolution.reflexion import ReflexionStore
     from nanoagent.evolution.runtime_memory.lesson_ingestor import LessonIngestor
     from nanoagent.evolution.runtime_memory.outcome_tracker import OutcomeTracker
@@ -34,9 +34,6 @@ _RESERVED_SLASH_CMDS = frozenset({"clear", "new", "sessions", "resume", "skill",
 
 # /feedback 单 skill 上限，超出 FIFO 丢最旧——避免 SKILL.md 前置块无限膨胀。
 _FEEDBACK_MAX_PER_SKILL = 20
-
-# 每次 distill 取最近 N 条 user message 作上下文
-_DISTILL_RECENT_WINDOW = 12
 
 # 单条 user message 截多长存进 session.meta.title
 _TITLE_MAX_CHARS = 50
@@ -97,7 +94,7 @@ class Harness:
         promotion_audit_callback: Optional["AuditCallback"] = None,
         session_key_prefix: str = _DEFAULT_SESSION_PREFIX,
         reflexions_store: Optional["ReflexionStore"] = None,
-        preference_distiller: Optional["PreferenceDistiller"] = None,
+        distill_pipeline: Optional["PreferenceDistillPipeline"] = None,
         preference_store: Optional["SkillPreferenceStore"] = None,
         session_history_warn_tokens: int = _SESSION_HISTORY_WARN_TOKENS_DEFAULT,
     ):
@@ -126,11 +123,10 @@ class Harness:
         # 注入到 SKILL.md 前置 `# 历史教训` 块。跟飞轮（trace-level lesson）
         # 不重叠：飞轮学 tool 协议失败修复，feedback 学 skill 行为偏好。
         self._reflexions = reflexions_store
-        # skill_switch / new_session 触发对**旧** skill 蒸馏
-        # （让用户在该 skill 里的对话沉淀成 NL preference summary）。
+        # turn_end / skill_switch / session_end 触发偏好蒸馏，沉淀 NL preference summary。
         # store 单独传一份给 /profile skill-prefs 子命令读 + 用户手动 delete。
         # 装配时未注入 → 全套 hook 静默跳过（向后兼容）。
-        self._preference_distiller = preference_distiller
+        self._distill_pipeline = distill_pipeline
         self._preference_store = preference_store
         # Session 级 context budget（最小版，对齐 nanobot：只量+提醒、不自动截断）。
         # Harness 自持一份 TokenCounter（谁用谁持），不伸手进 MainLoop 的内部字段。
@@ -196,7 +192,7 @@ class Harness:
         if text.startswith("/skill "):
             name = text.split(None, 1)[1].strip()
             if name == "none":
-                self._maybe_distill_active_skill(trigger="skill_switch")
+                self._maybe_distill(event="skill_switch")
                 self._current_skill = None
                 self._store.set_meta(self._session_key, current_skill=None)
                 return self._sys("已退出 skill 模式，回到 base。")
@@ -204,7 +200,7 @@ class Harness:
                 return self._sys(f"未知 skill: {name}。用 /skills 查看可用")
             # 切走前先对**旧** skill 做一次蒸馏（信号在该 skill 上下文里最准）
             if self._current_skill and self._current_skill != name:
-                self._maybe_distill_active_skill(trigger="skill_switch")
+                self._maybe_distill(event="skill_switch")
             self._current_skill = name
             self._store.set_meta(self._session_key, current_skill=name)
             return self._sys(f"已切入 skill: {name}")
@@ -252,7 +248,7 @@ class Harness:
         """显式 /new / /clear：创建并切换，返回用户可见的系统消息。"""
         # 切走当前 session 前先把**当前** skill 的对话蒸一次——
         # session_end 等价于"该 skill 的当前一段对话告一段落"，是稳定信号点
-        self._maybe_distill_active_skill(trigger="session_end")
+        self._maybe_distill(event="session_end")
         new_key = self._create_and_switch_to_new_session()
         return self._sys(f"已开新会话：{new_key}（用 /sessions 查看历史会话）")
 
@@ -408,47 +404,40 @@ class Harness:
         )
 
     # ============================================================
-    # PreferenceDistiller-Lite hook
+    # 偏好蒸馏 hook（turn_end / skill_switch / session_end → pipeline）
     # ============================================================
 
-    def _maybe_distill_active_skill(self, trigger: str) -> None:
-        """在 skill_switch / session_end 触发对当前 skill 蒸馏。fail-open。
+    def _maybe_distill(self, event: str) -> None:
+        """触发一次偏好蒸馏。fail-open。
 
-        信号源：
-          - 当前 session 的最近 N 条 user message（带 turn_id 占位 m-0/m-1...）
-          - ReflexionStore 里该 skill 的最近 feedback 历史
+        feedback 取自 ReflexionStore；window / summary / marker 由 pipeline 自行从
+        history + meta + store 取。pipeline 返回新 marker 时写回 session.meta。
         """
-        if self._preference_distiller is None or not self._current_skill:
+        if self._distill_pipeline is None or not self._current_skill:
             return
-        skill = self._current_skill
         history = self._store.get(self._session_key)
         if history is None:
             return
-        msgs = history.get_history()
-        # 只取 user role；倒数 _DISTILL_RECENT_WINDOW 条；turn_id = "m-<idx>"（idx 来自全 messages 序）
-        user_msgs: list[dict] = []
-        for idx, m in enumerate(msgs):
-            if m.get("role") == "user":
-                user_msgs.append({"turn_id": f"m-{idx}", "content": m.get("content", "")})
-        recent = user_msgs[-_DISTILL_RECENT_WINDOW:]
-
         feedback_history: list[str] = []
         if self._reflexions is not None:
             try:
-                fb_records = self._reflexions.read_recent("skill", skill, n=_FEEDBACK_MAX_PER_SKILL)
-                feedback_history = [r.content for r in fb_records]
+                fb = self._reflexions.read_recent("skill", self._current_skill, n=_FEEDBACK_MAX_PER_SKILL)
+                feedback_history = [r.content for r in fb]
             except Exception:
                 feedback_history = []
-
         try:
-            self._preference_distiller.maybe_distill(
-                skill=skill,
-                recent_user_messages=recent,
+            new_marker = self._distill_pipeline.maybe_distill(
+                skill=self._current_skill,
+                event=event,
+                history=history.get_history(),
+                meta=self._store.get_meta(self._session_key),
                 feedback_history=feedback_history,
-                trigger=trigger,
+                now=datetime.now(),
             )
+            if new_marker is not None:
+                self._store.set_meta(self._session_key, distill=new_marker)
         except Exception as e:
-            _logger.warning(f"PreferenceDistiller maybe_distill 异常（已 fail-open）: {e}")
+            _logger.warning(f"distill pipeline 异常（已 fail-open）: {e}")
 
     # ============================================================
     # /feedback：HITL 显式 skill 偏好反馈通道
@@ -595,6 +584,7 @@ class Harness:
         token_delta = self._loop.llm.usage.total_tokens - usage_before.total_tokens
         notice = self._update_session_meta_after_turn(text, token_delta)
         self._maybe_archive_digest(answer)
+        self._maybe_distill(event="turn_end")
         content = answer if notice is None else f"{answer}\n\n{notice}"
         return HarnessResponse(
             kind="assistant",

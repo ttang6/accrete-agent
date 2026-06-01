@@ -16,7 +16,11 @@ from pathlib import Path
 from typing import Optional
 
 from nanoagent.core.llm_client import LLMClient
-from nanoagent.evolution.preference_distiller import PreferenceDistiller
+from nanoagent.evolution.preference_pipeline.committer import PreferenceCommitter
+from nanoagent.evolution.preference_pipeline.context import DistillContextBuilder
+from nanoagent.evolution.preference_pipeline.pipeline import PreferenceDistillPipeline
+from nanoagent.evolution.preference_pipeline.scheduler import DistillScheduler
+from nanoagent.runtime.subagent import SubAgentRunner, build_subagent_llm
 from nanoagent.evolution.reflexion import ReflexionStore
 from nanoagent.evolution.skill_preference_audit import SkillPreferenceAuditWriter
 from nanoagent.evolution.skill_preference_store import SkillPreferenceStore
@@ -77,14 +81,16 @@ REFLEXIONS_DIR: Path = Path("data/reflexions")
 SKILL_PREFERENCES_PATH: Path = Path("data/memory/skill_preferences.json")
 SKILL_PREFERENCES_AUDIT_PATH: Path = Path("data/memory/skill_preferences_audit.jsonl")
 
-# PreferenceDistiller-Lite：副 LLM (qwen-flash via dashscope) 在 skill_switch /
-# session_end 触发蒸馏 NL preference summary。DASHSCOPE_API_KEY 缺失 → distiller=None
+# 偏好蒸馏 pipeline：副 LLM (qwen-flash via dashscope) 在 turn_end / skill_switch /
+# session_end 触发，沉淀 NL preference summary。DASHSCOPE_API_KEY 缺失 → pipeline=None
 # → Harness hook 静默跳过，向后兼容。
 DISTILLER_MODEL: str = "qwen-flash"
 DISTILLER_PROVIDER: str = "dashscope"
-DISTILLER_TIMEOUT: int = 15
-DISTILLER_MIN_TURNS: int = 10
-DISTILLER_DEBOUNCE_MIN: int = 30
+DISTILL_FLOOR: int = 3                # 自上次蒸馏新增 user 轮次下限
+DISTILL_CADENCE_TURNS_N: int = 30     # cadence 轮次阈值
+DISTILL_CADENCE_MINUTES_T: int = 30   # cadence 时间阈值（分钟）
+DISTILL_OVERLAP: int = 3              # 窗口回看重叠条数
+SUBAGENT_MAX_ITERATIONS: int = 1      # 零工具 policy sub-agent 上限
 ARXIV_STORAGE_DIR: Path = Path("data/arxiv_papers")  # arxiv-mcp-server 本地存储
 LESSONS_DB_PATH: Path = _DEFAULT_LESSONS_DB_PATH  # SSOT 在 sqlite_backend.DEFAULT_DB_PATH
 def _env_bool(name: str, default: bool) -> bool:
@@ -243,11 +249,11 @@ def build_runtime_memory(
         return None, None, None, None
 
 
-def build_preference_distiller(
+def build_distill_pipeline(
     store: SkillPreferenceStore,
     audit: SkillPreferenceAuditWriter,
-) -> Optional[PreferenceDistiller]:
-    """PreferenceDistiller-Lite：装配副 LLM (qwen-flash via dashscope) + 注入 store/audit。
+) -> Optional[PreferenceDistillPipeline]:
+    """装配偏好蒸馏 pipeline：scheduler + context + 隔离子 agent runner + committer。
 
     DASHSCOPE_API_KEY 缺失 / ENABLE_PREFERENCE_DISTILLER=False → None，
     Harness hook 会静默跳过（向后兼容）。
@@ -257,21 +263,23 @@ def build_preference_distiller(
     if not os.getenv("DASHSCOPE_API_KEY"):
         return None
     try:
-        llm = LLMClient(
+        return PreferenceDistillPipeline(
+            store=store,
+            scheduler=DistillScheduler(
+                floor=DISTILL_FLOOR,
+                cadence_turns_n=DISTILL_CADENCE_TURNS_N,
+                cadence_minutes_t=DISTILL_CADENCE_MINUTES_T,
+            ),
+            context_builder=DistillContextBuilder(),
+            runner=SubAgentRunner(llm_builder=build_subagent_llm),
+            committer=PreferenceCommitter(store, audit),
+            overlap=DISTILL_OVERLAP,
             model=DISTILLER_MODEL,
             provider=DISTILLER_PROVIDER,
-            instance_name="distiller",
-            timeout=DISTILLER_TIMEOUT,
-        )
-        return PreferenceDistiller(
-            llm=llm,
-            store=store,
-            audit_writer=audit,
-            min_turns=DISTILLER_MIN_TURNS,
-            debounce_minutes=DISTILLER_DEBOUNCE_MIN,
+            max_iterations=SUBAGENT_MAX_ITERATIONS,
         )
     except Exception as e:
-        print(f"[main] PreferenceDistiller 装配失败（已降级）: {e}")
+        print(f"[main] distill pipeline 装配失败（已降级）: {e}")
         return None
 
 
@@ -469,11 +477,11 @@ def main() -> int:
         else None
     )
 
-    preference_distiller = build_preference_distiller(preference_store, preference_audit)
-    if preference_distiller is not None:
+    distill_pipeline = build_distill_pipeline(preference_store, preference_audit)
+    if distill_pipeline is not None:
         print(
-            f"[PreferenceDistiller] enabled: {DISTILLER_PROVIDER}/{DISTILLER_MODEL} "
-            f"(min_turns={DISTILLER_MIN_TURNS}, debounce={DISTILLER_DEBOUNCE_MIN}min)"
+            f"[DistillPipeline] enabled: {DISTILLER_PROVIDER}/{DISTILLER_MODEL} "
+            f"(cadence={DISTILL_CADENCE_TURNS_N}turns/{DISTILL_CADENCE_MINUTES_T}min, floor={DISTILL_FLOOR})"
         )
 
     harness = Harness(
@@ -490,7 +498,7 @@ def main() -> int:
         promotion_gate=promotion_gate,
         promotion_audit_callback=promotion_audit_callback,
         reflexions_store=reflexions,
-        preference_distiller=preference_distiller,
+        distill_pipeline=distill_pipeline,
         preference_store=preference_store,
         session_history_warn_tokens=SESSION_HISTORY_WARN_TOKENS,
     )

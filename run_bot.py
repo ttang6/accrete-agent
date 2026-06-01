@@ -64,7 +64,7 @@ def build_harness_factory(
     lesson_ingestor,
     promotion_gate,
     promotion_audit_callback=None,
-    preference_distiller=None,
+    distill_pipeline=None,
     preference_store=None,
 ):
     """返回 (chat_id) -> Harness 的 closure。
@@ -91,7 +91,7 @@ def build_harness_factory(
             promotion_audit_callback=promotion_audit_callback,
             session_key_prefix=prefix,
             reflexions_store=loader.reflexions_store,
-            preference_distiller=preference_distiller,
+            distill_pipeline=distill_pipeline,
             preference_store=preference_store,
         )
     return factory
@@ -152,12 +152,12 @@ async def run_bot() -> int:
         else None
     )
 
-    preference_distiller = cli_main.build_preference_distiller(
+    distill_pipeline = cli_main.build_distill_pipeline(
         preference_store, preference_audit
     )
-    if preference_distiller is not None:
+    if distill_pipeline is not None:
         print(
-            f"[PreferenceDistiller] enabled: {cli_main.DISTILLER_PROVIDER}/"
+            f"[DistillPipeline] enabled: {cli_main.DISTILLER_PROVIDER}/"
             f"{cli_main.DISTILLER_MODEL}"
         )
 
@@ -171,7 +171,7 @@ async def run_bot() -> int:
         lesson_ingestor=lesson_ingestor,
         promotion_gate=promotion_gate,
         promotion_audit_callback=promotion_audit_callback,
-        preference_distiller=preference_distiller,
+        distill_pipeline=distill_pipeline,
         preference_store=preference_store,
     )
 
