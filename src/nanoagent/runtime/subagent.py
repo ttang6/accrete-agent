@@ -1,15 +1,8 @@
 """通用 SubAgent 层：受限、隔离的子 agent 执行引擎。
 
-镜像 Claude Code subagent 理念（https://code.claude.com/docs/en/sub-agents）：
-- **context 隔离**：子 agent 全新开始，只见显式传入的 `input_blocks` + override system
-  prompt；父对话历史 / memory / user_facts 一律不漏进来。这是本层的命门。
-- **system prompt 完全 override**（不是叠加）。
-- **工具 allowlist**：从父 registry 按名裁剪；硬剔除任何带 `is_subagent` 标记的 tool
-  —— 递归 guard，子 agent 不得再开子 agent。
-- **只回结果**：返回结构化 decision / 文本，中间过程不外泄。
-- **便宜模型**：可 per-request override（如 distill 用 qwen-flash）。
-
-本层不绑定任何用例。偏好蒸馏的 policy sub-agent（零工具）是第一个消费者。
+子 agent 全新开始，只见显式传入的 input_blocks + override system prompt（父对话
+历史 / memory 不漏入）；工具按 allowlist 从父 registry 裁剪并剔除 is_subagent tool
+（递归 guard）；只回结果。模型可 per-request override。不绑定具体用例。
 """
 
 from __future__ import annotations

@@ -1,8 +1,6 @@
-"""DistillContextBuilder：偏好蒸馏的 HOW 层（领域薄适配器）。
-
-只负责产出**具名 block**（装什么），封装/隔离交给通用 SubAgentContextBuilder。
-窗口从 `marker.last_message_index - overlap` 起切，带一点 overlap 让边界附近
-的偏好信号不被窗口切割丢掉；turn_id 用 history 全局 index（m-<idx>）。
+"""偏好蒸馏的 HOW 层：产出具名 block（current_summary / recent_window / feedback）。
+窗口从 marker.last_message_index - overlap 起切（留 overlap 防边界信号丢失）；
+turn_id 用 history 全局 index。
 """
 
 from __future__ import annotations

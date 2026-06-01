@@ -1,12 +1,8 @@
-"""PreferenceCommitter：偏好写入的**存储安全**层。
+"""偏好写入的存储安全层：硬校验（schema / update 时 new_summary 非空 / evidence
+turn_id 真实 / 长度上限）+ updated_at 弱乐观锁 + 原子写 + audit。
 
-职责边界（关键）：
-- **语义判断**（值不值得写）= policy sub-agent 的 `write_allowed`，不在这里。
-- **存储安全**（数据完整性 + 并发安全）= 本类。哪怕 sub-agent 说 `write_allowed=True`，
-  committer 仍**独立**把关：schema / update 时 new_summary 非空 / evidence turn_id 真实 /
-  长度上限 / 乐观锁 / 原子写。sub-agent 一句话绕不过这层。
-
-乐观锁用 `updated_at` 当弱版本号（sync 现状下 inert，是廉价保险；上异步时升级为 revision 字段）。
+与 sub-agent 的语义判断（write_allowed）分离：write_allowed 决定该不该写，本层
+独立守数据完整性，sub-agent 绕不过。
 """
 
 from __future__ import annotations
@@ -46,11 +42,9 @@ class PreferenceCommitter:
         valid_turn_ids: set[str],
         trigger: str = "periodic",
     ) -> CommitResult:
-        """把 policy sub-agent 的 decision 落盘（或拒绝）。fail-safe：任何不确定都不写。
+        """落盘或拒绝 decision。fail-safe：不确定就不写。
 
-        decision: {action, new_summary, write_allowed, confidence, evidence[], why_changed, risk}
-        base_updated_at: 组 job 时读到的 store updated_at，用于弱乐观锁
-        valid_turn_ids: 输入窗口里真实存在的 turn_id 集合，用于过滤 evidence
+        base_updated_at: 弱乐观锁基线；valid_turn_ids: 过滤 evidence 用的真实 turn_id。
         """
         old = self._store.get(skill)
         old_value = old.value if old else ""

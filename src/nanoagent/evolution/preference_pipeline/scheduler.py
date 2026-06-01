@@ -1,17 +1,9 @@
-"""DistillScheduler：偏好蒸馏的 WHEN 层（session 级，纯决策、无副作用）。
+"""偏好蒸馏的 WHEN 层（纯决策）：session_end / skill_switch / turn_end 三信号，
+都先过 floor guard（新增 user 轮次 >= floor）；cadence = (轮次 >= N) OR (距上次 >= T 分钟)。
 
-回答"现在要不要尝试蒸馏 + 为什么"，不回答"值不值得写"（那是 policy sub-agent）。
-
-三个信号，都先过同一个 floor guard（自上次蒸馏新增 user 轮次 >= floor）：
-  - session_end / skill_switch：边界收尾，过 floor 即触发。
-  - turn_end cadence：(新增轮次 >= N) OR (距上次 >= T 分钟)。
-
-marker（放 session.meta["distill"]）按 **message index** 记，不按 turn count——
-user/assistant 交错时 index 无歧义：
+marker 放 session.meta["distill"]，按 message index 记：
     {"last_message_index": int, "last_distilled_at": ISO str}
-
-时间分支只在 marker 有 last_distilled_at 时生效（Harness 在首轮初始化它）；
-缺失时返回 None，决策退化为纯轮次驱动——首次蒸馏由轮次（>= N）或边界事件触发。
+时间分支仅在有 last_distilled_at 时生效，否则退化为纯轮次驱动。
 """
 
 from __future__ import annotations

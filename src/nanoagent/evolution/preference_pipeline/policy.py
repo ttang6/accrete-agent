@@ -1,8 +1,5 @@
-"""PreferenceUpdatePolicy：语义 SAFETY + PROCEED 层的配置（prompt + 输出 schema）。
-
-这不是新机器，而是喂给通用 SubAgentRunner 的一份配置：override system prompt +
-结构化输出约定。sub-agent 输出 `write_allowed` 做**语义** gate（值不值得写）；
-**硬约束** gate（数据完整性 / 乐观锁）在 PreferenceCommitter，不在这里。
+"""偏好蒸馏 policy sub-agent 的配置：override system prompt + 结构化输出约定。
+sub-agent 输出 write_allowed 做语义判断；硬约束校验在 PreferenceCommitter。
 """
 
 from __future__ import annotations
@@ -54,8 +51,7 @@ POLICY_SYSTEM_PROMPT: Final[str] = """你是一个 user preference distiller。�
 - confidence=high 仅在 ≥3 个独立证据且跨 ≥2 turn 时给。
 """
 
-# 输出字段约定（文档用；SubAgentRunner 仅按"非 None → 解析 JSON"处理，
-# 结构由 prompt 约束、由 PreferenceCommitter 做硬校验）。
+# 输出字段约定（文档用；结构由 prompt 约束、由 committer 硬校验）。
 POLICY_OUTPUT_SCHEMA: Final[dict] = {
     "action": "keep | update | clear",
     "new_summary": "str",
