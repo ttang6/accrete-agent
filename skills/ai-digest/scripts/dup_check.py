@@ -36,9 +36,8 @@ from _common import ensure_utf8_stdout, print_error, read_args
 _SKILL_ROOT = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _SKILL_ROOT.parent.parent
 
-# 默认全局单例；env override 让 dose-response / dogfood driver 把每个 sandbox 的
-# 历史隔离到独立路径——避免跨实验 dup 表污染（详见 docs/codex_dogfood/
-# preference_dose_response_driver.py 的 setup_isolation 注释）。
+# 默认全局单例；env override 可把历史隔离到独立路径，避免并行跑（如批量测试）
+# 之间 dup 表互相污染。
 _HISTORY_PATH_DEFAULT = _PROJECT_ROOT / "data" / "memory" / "digest_reported.jsonl"
 _HISTORY_PATH = Path(
     os.getenv("NANOAGENT_DIGEST_HISTORY_PATH", str(_HISTORY_PATH_DEFAULT))

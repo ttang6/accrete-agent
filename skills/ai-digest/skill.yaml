@@ -1,6 +1,6 @@
 name: ai-digest
 
-# Action contracts (advisor 第二轮裁定 RequiredActionGate)：
+# Action contracts（RequiredActionGate）：
 # 用户表达某种意图时产生 obligation；finish 前未满足 → harness inject repair hint。
 #
 # 何时产生 obligation 不依赖 LLM 自己读 SKILL.md，而是 lexical_hints 子串匹配
@@ -29,8 +29,8 @@ action_contracts:
         请用 skill_exec(skill="ai-digest", script="dup_check", args={"action":"mark","items":[...]}) 真实调用，
         或者在最终回答里明确说明跳过 mark 的理由（例如"今日没有采纳新条目"）。
 
-# Evaluation triggers (advisor 第二轮裁定 evaluator trigger 声明化)：
-# 之前 _DIGEST_MARKERS 硬编码在 harness.py:35，违反 skill-as-plugin。现在
+# Evaluation triggers（evaluator trigger 声明化）：
+# 之前 _DIGEST_MARKERS 硬编码在 harness.py，违反 skill-as-plugin。现在
 # trigger 在 skill 自带的 manifest 里，harness 只 dispatch。
 #
 # v0 只支持 on_answer_contains_any（替换原硬编码 markers）。可以容纳 LLM
@@ -44,11 +44,10 @@ evaluation:
         - "## 开源"
         - "## 行业"
 
-# Coverage contract (PR 2)：硬覆盖检查的类别 / 阈值 / 计数 regex。
-# 之前在 src/nanoagent/runtime/turn_context.py 顶部 _CATEGORY_MAP / _DEFAULT_THRESHOLDS /
-# _COUNT_RE 三个模块级常量硬编码 ai-digest 业务，违反 framework / skill 边界。
-# 现在装配层（main.py build_loop）扫所有 skill 的 coverage manifest union 合并后注入
-# CoverageChecker。改这里就改 ai-digest 的覆盖标准，不需要改 runtime 代码。
+# Coverage contract：硬覆盖检查的类别 / 阈值 / 计数 regex。
+# 装配层（main.py build_loop）扫所有 skill 的 coverage manifest，union 合并后注入
+# CoverageChecker。改这里就改 ai-digest 的覆盖标准，不需要改 runtime 代码——
+# framework 不内建任何 skill 业务知识。
 #
 # 字段：
 # - name: CoverageChecker.counts 的 key（也是 missing_categories 报告里的标签）
@@ -81,8 +80,8 @@ coverage:
       count_pattern: '(\d+)\s*篇'
       suggestion: fetch_rss
 
-# Archive contract (PR 3)：满足任一 markers 的 answer 触发归档落盘。
-# 之前 _DIGEST_ARCHIVE_MARKERS 6 元组硬编码在 harness.py:36，违反 framework
+# Archive contract：满足任一 markers 的 answer 触发归档落盘。
+# 之前 _DIGEST_ARCHIVE_MARKERS 6 元组硬编码在 harness.py，违反 framework
 # 边界。现在 manifest 化后 harness 只 dispatch。
 #
 # 与 evaluation.triggers 形似但语义不同：evaluation 决定要不要跑 evaluator
