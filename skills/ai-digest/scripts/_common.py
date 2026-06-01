@@ -74,25 +74,3 @@ def load_sources(category: Optional[str] = None) -> list[dict]:
 def print_error(msg: str) -> None:
     """统一错误输出。LLM 看到 `[error]` 前缀知道是失败。"""
     print(f"[error] {msg}", file=sys.stderr)
-
-
-def load_x_users(category: Optional[str] = None) -> list[dict]:
-    """加载 sources.yaml 的 x_users curated 列表。
-
-    结构与 sources 同款：{username, category, priority, name?}。
-    category 可选过滤；缺省字段 / 格式错 → 返回空 list（兜底不崩）。
-    """
-    if not _SOURCES_PATH.exists():
-        return []
-    try:
-        with open(_SOURCES_PATH, encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-    except Exception:
-        return []
-    users = data.get("x_users") or []
-    if not isinstance(users, list):
-        return []
-    users = [u for u in users if isinstance(u, dict) and u.get("username")]
-    if category:
-        users = [u for u in users if (u.get("category") or "").lower() == category.lower()]
-    return users
