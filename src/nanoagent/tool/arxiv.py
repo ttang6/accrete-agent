@@ -60,6 +60,19 @@ class ArxivTool(BaseTool):
     def name(self) -> str:
         return "arxiv"
 
+    def op_key(self, kwargs: dict) -> str:
+        """arxiv 的 op 投影 = action(+query)（工具自声明）。
+
+        修掉"8 个 action 全挤进一个 arxiv 桶"的塌缩：每个 action 独立计数；
+        search_papers 这类带 query 的再按 query 细分（同一 query 反复失败才累加）。
+        """
+        d = kwargs or {}
+        action = str(d.get("action", "") or "").strip()
+        query = str(d.get("query", "") or "").strip()
+        if action and query:
+            return f"arxiv:{action}:{query}"
+        return f"arxiv:{action}" if action else "arxiv"
+
     @property
     def description(self) -> str:
         return (

@@ -64,7 +64,10 @@ TASK_FILE: str = ""  # 路径字符串，按 utf-8 读取
 
 # LLM 参数
 MODEL: str = os.getenv("OPENAI_MODEL_ID", "gpt-5.4-mini")
-PROVIDER: str = ""  # 留空 = openai；可选 dashscope / zhipu / deepseek / ollama / vllm
+PROVIDER: str = ""  # 留空 = openai；可选 dashscope / dashscope_us / zhipu / deepseek / ollama / vllm
+# provider 透传 body（如 qwen 的 enable_thinking=False 关思考——agent 工具循环不需要
+# 长推理，关掉快 ~8×、省 ~10× 输出 token）。None = 不透传。eval driver 可 patch 注入。
+MODEL_EXTRA_BODY: Optional[dict] = None
 MAX_ITERATIONS: int = 20
 
 # P0.3 副 LLM Evaluator（日报质量评审）。DASHSCOPE_API_KEY 未设时跳过。
@@ -113,6 +116,9 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 ENABLE_LESSON_RECALL: bool = _env_bool("NANOAGENT_ENABLE_LESSON_RECALL", True)  # Phase C：第 1 次失败时也查 backend 中的 promoted lesson
+# 滑窗失败率总闸（Track A-b.4）。默认开（生产兜底）。Track E eval 关掉：实测它在 R2
+# 上抢在熔断器降级完成前掐断、抹平熔断收益（详见 main_loop 注释）。
+ENABLE_FAILURE_RATE_GATE: bool = _env_bool("NANOAGENT_ENABLE_FAILURE_RATE_GATE", True)
 # PreferenceDistiller-Lite 装配开关。DASHSCOPE_API_KEY 缺失也会自然降级为 None。
 ENABLE_PREFERENCE_DISTILLER: bool = _env_bool("NANOAGENT_ENABLE_PREFERENCE_DISTILLER", True)
 
@@ -349,6 +355,7 @@ def build_loop(
         model=MODEL,
         provider=PROVIDER or None,
         instance_name="main_loop",
+        extra_body=MODEL_EXTRA_BODY,
     )
     counter, store, budget_cfg = build_context_hygiene()
     contracts = [skill_loader.get_contract(n) for n in skill_loader.list_skills()]
@@ -359,6 +366,7 @@ def build_loop(
         tool_registry=build_registry(skill_loader),
         max_iterations=MAX_ITERATIONS,
         coverage_specs=coverage_specs,
+        enable_failure_rate_gate=ENABLE_FAILURE_RATE_GATE,
         lesson_retriever=lesson_retriever,
         token_counter=counter,
         tool_output_store=store,

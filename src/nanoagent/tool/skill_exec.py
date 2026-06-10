@@ -60,6 +60,22 @@ class SkillExecTool(BaseTool):
     def name(self) -> str:
         return "skill_exec"
 
+    def op_key(self, kwargs: dict) -> str:
+        """skill_exec 的 op 投影 = skill/script:args-hash（工具自声明）。
+
+        熔断/计数粒度到"具体脚本 + 具体 args"：同一 turn 内反复以同一组 args 调同
+        一脚本（典型的 identical_retry 死循环）才累加；换 args（如 dup_check 从
+        action=check 改 mark）算新 op。lesson 召回仍按 skill/script 粗匹配（见
+        failure_memory._operation_key 的 recall_key），两者粒度有意不同。
+        """
+        from nanoagent.tool.base import _args_hash
+        d = kwargs or {}
+        skill = str(d.get("skill", "") or "?").strip() or "?"
+        script = str(d.get("script", "") or "?").strip() or "?"
+        inner = d.get("args")
+        h = _args_hash(inner if isinstance(inner, dict) else {})
+        return f"skill_exec:{skill}/{script}:{h}"
+
     @property
     def description(self) -> str:
         return (

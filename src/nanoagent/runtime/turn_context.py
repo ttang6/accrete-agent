@@ -30,8 +30,8 @@ from nanoagent.runtime.failure_memory import (  # noqa: F401
     FailureMemory,
     _canonical_args_hash,
     _classify_tool_failure,
-    _failure_key,
     _is_tool_failure,
+    _operation_key,
 )
 from nanoagent.runtime.obligation_tracker import ObligationTracker
 from nanoagent.skills.contract import CoverageCategorySpec
@@ -184,11 +184,18 @@ class CoverageChecker:
 
 @dataclass
 class TurnContext:
-    """MainLoop 每次 run() 构造一份。聚合 coverage + failure_memory + obligation_tracker。"""
+    """MainLoop 每次 run() 构造一份。聚合 coverage + failure_memory + obligation_tracker。
+
+    disabled_ops：per-op 熔断状态（ephemeral per-turn）。op_key → 已禁用时回给 LLM
+    的 `[熔断]` 消息。run 结束即丢，不持久化（见 circuit_breaker.py）。
+    tool_outcomes：每次 tool 调用一个 bool（True=失败），供滑窗失败率总闸判定。
+    """
 
     coverage: CoverageChecker = field(default_factory=CoverageChecker)
     failure_memory: FailureMemory = field(default_factory=FailureMemory)
     obligation_tracker: ObligationTracker = field(default_factory=ObligationTracker)
+    disabled_ops: dict[str, str] = field(default_factory=dict)
+    tool_outcomes: list[bool] = field(default_factory=list)
 
     @classmethod
     def create(

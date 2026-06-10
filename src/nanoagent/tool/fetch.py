@@ -31,14 +31,86 @@ auto 路由规则（当前）：
           extract_prompt="列出前 10 篇论文")
 """
 
+import random
+import re
+import time
+from typing import Optional
+
 import html2text
 import requests
 import trafilatura
 from bs4 import BeautifulSoup
 from nanoagent.core.logger import get_logger
-from nanoagent.tool.base import BaseTool
+from nanoagent.tool.base import BaseTool, ToolFailure
 
 _logger = get_logger("fetch")
+
+# in-tool retry 保留但**短**（2 次 = 1 retry）：内部退避算"给熔断 1 次失败"，
+# 不跟熔断器的 N 叠成一长串。剩下的重试由 per-op 熔断器（transient N=2）兜。
+_FETCH_MAX_ATTEMPTS = 2
+_FETCH_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+# fetch 错误串里的稳定 klass 信号 token：_get_with_retry 在 catch 点写、
+# classify_failure 读（集中在此防 drift）。klass 由工具自己从 requests.exceptions
+# 类型确定，不靠框架猜人话字符串。
+_FETCH_TRANSIENT_TOKENS = ("timeout", "connection error", "server error")
+_FETCH_PERMANENT_TOKENS = ("http 错误",)  # raise_for_status 的 4xx（5xx 走 server error 退避路径）
+
+
+def _parse_retry_after(resp) -> Optional[float]:
+    """解析服务器 Retry-After 头（秒数或 HTTP-date）→ 秒。无 / 解析失败 → None。"""
+    raw = resp.headers.get("Retry-After") if resp is not None else None
+    if not raw:
+        return None
+    raw = raw.strip()
+    if raw.isdigit():
+        return float(raw)
+    try:
+        from datetime import datetime, timezone
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(raw)
+        if dt is None:
+            return None
+        return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+    except Exception:
+        return None
+
+
+def _get_with_retry(url: str):
+    """GET url，对 transient（Timeout / ConnectionError / 5xx / 429）做有界退避重试。
+
+    返回 (resp, None) 成功，或 (None, err_str)。err_str 带 `[执行错误]` 前缀（命中失败签名
+    便于计数）；transient 类含 timeout/connection error/server error 等稳定 token，
+    4xx 含 "HTTP 错误"——FetchTool.classify_failure 据此给 typed klass。
+    退避优先用服务器 Retry-After（429/503），否则指数退避 + 抖动。
+    """
+    last = f"[执行错误] fetch 请求失败: {url}"
+    for attempt in range(_FETCH_MAX_ATTEMPTS):
+        retry_after = None
+        try:
+            resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code in _FETCH_RETRYABLE_STATUS:
+                retry_after = _parse_retry_after(resp)
+                ra_note = f" retry_after={retry_after:.0f}" if retry_after else ""
+                last = f"[执行错误] fetch 上游 HTTP {resp.status_code} server error{ra_note}: {url}"
+            else:
+                resp.raise_for_status()
+                return resp, None
+        except requests.exceptions.Timeout:
+            last = f"[执行错误] fetch 请求超时 timeout: {url}"
+        except requests.exceptions.ConnectionError as e:
+            last = f"[执行错误] fetch 连接失败 connection error: {e}"
+        except requests.exceptions.HTTPError as e:
+            return None, f"[执行错误] fetch HTTP 错误: {e}"
+        except requests.exceptions.RequestException as e:
+            return None, f"[执行错误] fetch 请求失败: {e}"
+        if attempt < _FETCH_MAX_ATTEMPTS - 1:
+            if retry_after is not None:
+                time.sleep(min(retry_after, 8.0))  # 尊重服务器建议，但 cap 防 retry storm
+            else:
+                time.sleep(min(0.5 * (2 ** attempt), 4.0) * (0.5 + random.random()))
+    _logger.warning(f"[fetch] transient 重试 {_FETCH_MAX_ATTEMPTS} 次仍失败: {url}")
+    return None, last
 
 
 def _build_html2text() -> html2text.HTML2Text:
@@ -106,6 +178,39 @@ class FetchTool(BaseTool):
     def name(self) -> str:
         return "fetch"
 
+    def op_key(self, kwargs: dict) -> str:
+        """fetch 的 op 投影 = 具体 URL（工具自声明，非框架按 host 猜）。
+
+        熔断/计数粒度到单个失败 URL：同一 turn 内反复抓同一个挂掉的 URL 才累加，
+        换个 URL（哪怕同 host）算新 op。url 缺失时退回裸 'fetch'。
+        """
+        url = str((kwargs or {}).get("url", "") or "").strip()
+        return f"fetch:{url}" if url else "fetch"
+
+    def classify_failure(self, kwargs: dict, output: str, exc=None) -> ToolFailure:
+        """从 fetch 自己写的（工具拥有的）错误串映射出 typed klass + retry_after。
+
+        klass 在 _get_with_retry 的 catch 点由 requests.exceptions 类型确定并写进
+        稳定 token，这里只读自己的 token（不是框架猜人话）：
+        - 4xx（HTTP 错误）→ permanent（不会自愈，别重试）
+        - 超时 / 连接失败 / 5xx / 429（server error）→ transient（值得重试 + 退避）
+        - 其它 → None（说不清，best-effort）
+        """
+        low = (output or "").lower()
+        klass = None
+        if any(t in low for t in _FETCH_PERMANENT_TOKENS):
+            klass = "permanent"
+        elif any(t in low for t in _FETCH_TRANSIENT_TOKENS):
+            klass = "transient"
+        retry_after = None
+        m = re.search(r"retry_after=(\d+)", low)
+        if m:
+            retry_after = float(m.group(1))
+        return ToolFailure(
+            op_key=self.op_key(kwargs), klass=klass,
+            is_mutating=False, retry_after=retry_after,
+        )
+
     @property
     def description(self) -> str:
         return (
@@ -171,24 +276,11 @@ class FetchTool(BaseTool):
             resolved_mode = _auto_route_mode(url)
             _logger.info(f"[fetch] auto-route: {url} → {resolved_mode}")
 
-        # 下载页面
+        # 下载页面（transient 在工具内有界退避重试）
         _logger.info(f"[fetch] GET {url} (extract={requested_mode}, resolved={resolved_mode})")
-        try:
-            resp = requests.get(
-                url,
-                timeout=15,
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            resp.raise_for_status()
-        except requests.exceptions.Timeout:
-            _logger.warning(f"[fetch] timeout: {url}")
-            return f"请求超时: {url}"
-        except requests.exceptions.HTTPError as e:
-            _logger.warning(f"[fetch] HTTP error on {url}: {e}")
-            return f"HTTP 错误: {e}"
-        except requests.exceptions.RequestException as e:
-            _logger.warning(f"[fetch] request error on {url}: {e}")
-            return f"请求失败: {e}"
+        resp, err = _get_with_retry(url)
+        if err is not None:
+            return err
 
         html = resp.text
         metadata = self._extract_metadata(html, resp.url)

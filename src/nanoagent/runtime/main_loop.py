@@ -18,12 +18,13 @@ from nanoagent.runtime.context_budget import ContextBudget, ContextBudgetConfig
 from nanoagent.runtime.stop_condition import (
     DEFAULT_REPEAT_FAILURE_THRESHOLD,
     StopReason,
-    check_repeated_failure,
+    check_failure_rate,
     format_forced_stop_message,
 )
 from nanoagent.runtime.token_counter import TokenCounter
 from nanoagent.runtime.tool_output_store import ToolOutputStore
 from nanoagent.runtime.failure_memory import _is_tool_failure
+from nanoagent.runtime.circuit_breaker import breaker_threshold, format_breaker_message
 from nanoagent.runtime.turn_context import TurnContext
 
 # 从 [tool-call-repair-required] 文本里抽 example_call JSON 块。
@@ -76,6 +77,7 @@ class MainLoop(BaseAgent):
                  coverage_thresholds: Optional[dict[str, int]] = None,
                  coverage_specs: Optional[list] = None,
                  repeat_failure_threshold: int = DEFAULT_REPEAT_FAILURE_THRESHOLD,
+                 enable_failure_rate_gate: bool = True,
                  lesson_retriever=None,
                  token_counter: Optional[TokenCounter] = None,
                  tool_output_store: Optional[ToolOutputStore] = None,
@@ -104,6 +106,10 @@ class MainLoop(BaseAgent):
         self._coverage_thresholds = coverage_thresholds
         self._coverage_specs = coverage_specs
         self._repeat_failure_threshold = repeat_failure_threshold
+        # 滑窗失败率总闸开关。eval 实测：N=3 熔断让单个持续死源贡献 3 次 pre-trip 失败，
+        # 在 5 样本窗口里 3/5=0.6>0.5 抢在活源成功前触发，把 R2 降级（熔断器本该救的）
+        # 也掐掉 → 抹平熔断器收益。Track E 关掉它，让 per-op 熔断器单独说话。
+        self._enable_failure_rate_gate = enable_failure_rate_gate
         self._lesson_retriever = lesson_retriever
         # token_counter 默认构造一份（cl100k_base，tiktoken 不可用时自动 fallback）
         self._token_counter = token_counter if token_counter is not None else TokenCounter()
@@ -343,11 +349,21 @@ class MainLoop(BaseAgent):
     def _augment_with_failure_memory(
         self, c: dict, result: str, iteration: int
     ) -> str:
-        """同 (tool, args_hash) 连续失败 augment recovery hint；首次失败若 backend
-        命中 promoted lesson 也 augment。返回（可能被增强的）result。"""
+        """累加 op_key 失败计数 + 首次失败 backend lesson 召回。返回（可能被
+        lesson 增强的）result。
+
+        harness-recovery 已退役：2nd+ 次失败不再注入 hint 文本，但仍发
+        FAILURE_RECOVERY_HINT trace（重复失败 telemetry，供 episode_extractor /
+        复盘消费）；唯一会改 result 的 augment 通道是首次失败的 [runtime-lesson]。
+
+        count_key 用工具自声明的 op_key（`tool.op_key(kwargs)`）—— 跟后续熔断器
+        同一把键，单一计数源。工具不在 registry（理论上不会）时退回 None，
+        maybe_augment 自走 _operation_key 默认投影。"""
+        tool = self.tool_registry.get(c["name"])
+        op_key = tool.op_key(c["kwargs"]) if tool is not None else None
         augmented_result, failure_entry, used_lesson = (
             self._turn_ctx.failure_memory.maybe_augment(
-                c["name"], c["kwargs"], c["raw_args"], result
+                c["name"], c["kwargs"], c["raw_args"], result, op_key=op_key
             )
         )
         if failure_entry is not None:
@@ -367,6 +383,35 @@ class MainLoop(BaseAgent):
                 confidence=used_lesson.confidence,
             )
         return augmented_result
+
+    def _maybe_trip_breaker(self, c: dict, result: str, iteration: int) -> str:
+        """per-op 熔断：失败的 op 连续失败达 klass policy 阈值 → 禁本轮 + 在 result
+        末尾追加 [熔断] 消息让 LLM 立刻看到。
+
+        计数读 FailureMemory.entries（_augment_with_failure_memory 已按同一把
+        op_key 计过，单一计数源不漂移）；klass/is_mutating 读 tool.classify_failure。
+        已禁的 op（再次失败或被禁后回的 [熔断] 消息）不重复 trip。"""
+        if not (isinstance(result, str) and _is_tool_failure(result)):
+            return result
+        tool = self.tool_registry.get(c["name"])
+        if tool is None:
+            return result
+        tf = tool.classify_failure(c["kwargs"], result)
+        if tf.op_key in self._turn_ctx.disabled_ops:
+            return result
+        entry = self._turn_ctx.failure_memory.entries.get(tf.op_key)
+        count = entry.failure_count if entry is not None else 0
+        threshold = breaker_threshold(tf.klass, tf.is_mutating)
+        if count < threshold:
+            return result
+        msg = format_breaker_message(c["name"], tf.op_key, count, tf.klass)
+        self._turn_ctx.disabled_ops[tf.op_key] = msg
+        self._trace(
+            action=ts.ACTION_CIRCUIT_OPEN, iteration=iteration,
+            tool=c["name"], op_key=tf.op_key, klass=tf.klass or "",
+            failure_count=count, threshold=threshold, is_mutating=tf.is_mutating,
+        )
+        return result + "\n\n" + msg
 
     def _observe_coverage(
         self, c: dict, augmented_result: str, iteration: int
@@ -394,12 +439,15 @@ class MainLoop(BaseAgent):
     def _check_stop_condition(
         self, messages: list[Message], iteration: int
     ) -> Optional[str]:
-        """同参数连续失败超阈值时构造强制终止消息并 emit STOP/FINISH trace；
-        无需停止时返 None。返回非 None 时 caller 必须 return forced_msg。"""
-        stop_decision = check_repeated_failure(
-            self._turn_ctx.failure_memory,
-            threshold=self._repeat_failure_threshold,
-        )
+        """总闸：滑窗 tool 失败率过高时构造强制终止消息并 emit STOP/FINISH trace；
+        无需停止时返 None。返回非 None 时 caller 必须 return forced_msg。
+
+        per-op 死循环已由熔断器（disabled_ops）就地挡掉；这道总闸只兜"整个 turn
+        大面积失败"——停 turn 不停 run，很少触发、主要叙事兜底。max_iterations 是
+        独立的步数终止保证。enable_failure_rate_gate=False 时整道闸 no-op。"""
+        if not self._enable_failure_rate_gate:
+            return None
+        stop_decision = check_failure_rate(self._turn_ctx.tool_outcomes)
         if not stop_decision.should_stop:
             return None
         forced_msg = format_forced_stop_message(stop_decision)
@@ -564,6 +612,14 @@ class MainLoop(BaseAgent):
                             f"错误: 工具 '{tool_name}' 不存在。"
                             f"可用: {self.tool_registry.list_tools()}"
                         )
+                    else:
+                        # per-op 熔断：该 op 本轮已被禁 → 不执行，直接回 [熔断] 消息，
+                        # 交回 LLM 换路子（turn 继续）。
+                        disabled_msg = self._turn_ctx.disabled_ops.get(
+                            self.tool_registry.get(tool_name).op_key(tool_kwargs)
+                        )
+                        if disabled_msg is not None:
+                            prebuilt_error = disabled_msg
 
                     call_plan.append({
                         "tc": tc,
@@ -649,6 +705,12 @@ class MainLoop(BaseAgent):
                     augmented_result = self._augment_with_failure_memory(
                         c, result, iteration
                     )
+                    augmented_result = self._maybe_trip_breaker(
+                        c, augmented_result, iteration
+                    )
+                    # 记一笔 tool 结果成败，供滑窗失败率总闸判定（[熔断] 消息本身
+                    # 非失败 → 不计入，避免被禁 op 的重复调用稀释失败率）
+                    self._turn_ctx.tool_outcomes.append(_is_tool_failure(augmented_result))
                     self._observe_coverage(c, augmented_result, iteration)
                     self._track_obligation(c, augmented_result)
 

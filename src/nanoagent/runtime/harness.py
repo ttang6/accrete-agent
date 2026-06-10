@@ -156,8 +156,15 @@ class Harness:
         if not text:
             return self._sys("（空输入已忽略）")
 
+        # 仅当首 token 是已注册命令 / skill 时才走斜杠命令路径；否则 fall through
+        # 到对话。避免把 `/etc/passwd ...`、`/unknownword` 等合法消息吃成"未知命令"。
+        # 有意取舍：typo 命令静默当对话消息（对齐 Claude Code 宽松 pass-through）。
         if text.startswith("/"):
-            return self._handle_slash(text)
+            known = _RESERVED_SLASH_CMDS | set(self._loader.list_skills())
+            parts = text[1:].split(maxsplit=1)   # 先取列表
+            first = parts[0] if parts else ""    # 防 "/  " strip 后只剩 "/" → IndexError
+            if first and "/" not in first and first in known:
+                return self._handle_slash(text)
 
         return self._handle_dialogue(text)
 

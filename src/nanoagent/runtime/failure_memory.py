@@ -1,8 +1,11 @@
-"""FailureMemory — 失败记忆 recovery 模块。
+"""FailureMemory — 失败计数 + lesson 召回模块（harness-recovery 已退役）。
 
-跟踪 `(tool_name, args_hash)` 的失败次数 + 错误类型 + 下一步建议。
-2nd 次同参数失败时在 tool_result 末尾追加 `[harness-recovery]` 提示，
-让 LLM 下一轮必然看到，避免无限 identical_retry。
+跟踪 operation_key（意图级）的失败次数 + 错误类型 + 下一步建议。
+计数 key = operation_key（skill 脚本=`skill_exec:skill/script`；fetch 按 host；其余=tool_name），
+不含 args_hash（args_hash 降级为 entry 内 debug metadata）。
+`[harness-recovery]` hint 已退役——2nd+ 次失败不再注入任何提示文本；只保留
+failure_count（供 stop_condition.check_repeated_failure 防循环 loop guard 读）。
+1st 次失败的 lesson 召回（[runtime-lesson]）保留——那是飞轮通道，不是 harness-recovery。
 
 入门友好视角：
 - 一个 turn（MainLoop.run）创建一份 FailureMemory，run 结束就扔掉
@@ -57,7 +60,9 @@ if TYPE_CHECKING:
 _SUGGESTED_NEXT_ACTION: Final[dict[str, str]] = {
     "schema_mismatch": "describe_script",
     "transient": "retry_same_later",
-    "unknown": "change_params",
+    # 非 transient/非 schema 失败（含 4xx / API exception / 源不可用）实测最常靠换工具或换源恢复，
+    # 而非改同一调用的参数
+    "unknown": "switch_tool_or_source",
 }
 
 
@@ -66,20 +71,30 @@ _SUGGESTED_NEXT_ACTION: Final[dict[str, str]] = {
 # ============================================================
 
 
-def _failure_key(tool_name: str, kwargs: dict, raw_args: str) -> tuple[str, str]:
-    """构造 FailureMemory 的 key。
+def _url_host(url: str) -> str:
+    """从 URL 取 host（含端口）；失败回退到截断字符串。用于 fetch 的意图级计数。"""
+    from urllib.parse import urlparse
+    try:
+        return urlparse(url).netloc or (url[:40] if url else "?")
+    except Exception:
+        return url[:40] if url else "?"
 
-    tool_name == "skill_exec" 时，用 "skill_exec:<skill>/<script>" 作 name
-    前缀（trace 可读性）；其他 tool 直接用 tool_name。args_hash 部分统一走
-    canonical。
+
+def _operation_key(tool_name: str, kwargs: dict, raw_args: str) -> tuple[str, str]:
+    """构造 (count_key, recall_key)。
+
+    - count_key：失败计数键（意图级，不含 args）。skill 脚本=`skill_exec:skill/script`；
+        fetch 按 host；其余=tool_name。
+    - recall_key：lesson 召回匹配键，对齐 `episode_extractor._build_tool_key`。
     """
     if tool_name == "skill_exec" and isinstance(kwargs, dict):
-        skill = kwargs.get("skill", "?")
-        script = kwargs.get("script", "?")
-        prefix = f"skill_exec:{skill}/{script}"
-    else:
-        prefix = tool_name
-    return (prefix, _canonical_args_hash(raw_args))
+        k = f"skill_exec:{kwargs.get('skill', '?')}/{kwargs.get('script', '?')}"
+        return (k, k)
+    if tool_name == "fetch" and isinstance(kwargs, dict):
+        url = str(kwargs.get("url", "") or "")
+        if url:
+            return (f"fetch:{_url_host(url)}", "fetch")
+    return (tool_name, tool_name)
 
 
 # ============================================================
@@ -89,26 +104,30 @@ def _failure_key(tool_name: str, kwargs: dict, raw_args: str) -> tuple[str, str]
 
 @dataclass
 class FailureEntry:
-    """一条失败记录。key 是 (tool_key, args_hash) 在 FailureMemory.entries 里。"""
+    """一条失败记录。entries 的 key 是 operation_key（意图级）。
+    last_args_hash 仅作 debug metadata（不进 key）。"""
     failure_count: int = 0
     last_error_type: str = "unknown"
-    suggested_next_action: str = "change_params"
+    suggested_next_action: str = "switch_tool_or_source"
+    last_args_hash: str = ""
 
 
 @dataclass
 class FailureMemory:
-    """跟踪 (tool_name, args_hash) 的失败次数 + 分类，2nd 次触发 augment。
+    """跟踪 operation_key（意图级）的失败次数 + 分类。
 
-    可选 `lesson_retriever` 让 1st 次失败也能命中 backend 中的
-    promoted lesson 立即 augment——把跨 trace 经验接入 in-turn 决策。
+    2nd+ 次失败只累加 failure_count（供 stop_condition loop guard），不再注入
+    harness-recovery hint（已退役）。可选 `lesson_retriever` 让 1st 次失败命中
+    backend promoted lesson 时立即 augment——把跨 trace 经验接入 in-turn 决策。
     """
 
-    entries: dict[tuple[str, str], FailureEntry] = field(default_factory=dict)
+    entries: dict[str, FailureEntry] = field(default_factory=dict)  # key = operation_key
     # Optional["LessonRetriever"] 字面量化避免运行时 import 循环
     lesson_retriever: Optional["LessonRetriever"] = None
 
     def maybe_augment(
-        self, tool_name: str, kwargs: dict, raw_args: str, result: str
+        self, tool_name: str, kwargs: dict, raw_args: str, result: str,
+        *, op_key: Optional[str] = None,
     ) -> Tuple[str, Optional[FailureEntry], Optional["RuntimeLesson"]]:
         """观察一次 tool 输出，若是失败则尝试 augment。
 
@@ -116,31 +135,41 @@ class FailureMemory:
           - 成功调用 → (result, None, None) 不动
           - 首次失败 + backend 命中 → (augmented_result, None, lesson) [runtime-lesson] 注入
           - 首次失败 + backend 未命中 → (result, None, None) 只记录不 augment
-          - 2nd+ 次失败 → (augmented_result, entry, None) [harness-recovery] 注入
+          - 2nd+ 次失败 → (result, entry, None) 只累加 failure_count，不注入任何 hint
+            （harness-recovery 已退役；entry 非 None 仅供 main_loop 发
+            FAILURE_RECOVERY_HINT 重复失败 telemetry trace）
+
+        计数键（count_key）：优先用工具自声明的 `op_key`（main_loop 从
+        `tool.op_key(kwargs)` 取，是熔断器也会用的同一把键——单一计数源不漂移）；
+        op_key 为 None 时退回 `_operation_key` 的默认投影（直接调用 / 单测路径）。
+        lesson 召回键（recall_key）始终走 `_operation_key`，跟 episode_extractor
+        的存储键对齐（与计数粒度有意不同）。
 
         设计取舍：
-        - 第 1 次和第 2nd+ 次的 augment 通道不重叠（一次失败最多一种 hint）
-        - 优先级：backend lesson 优先于 in-turn 重复（1st 次能拉回就不等 2nd）
+        - 唯一的 in-turn augment 通道是 1st 次失败的 backend lesson 召回
         - retriever 为 None 时退化到只记录不召回的原行为，已有调用方无感
+        - failure_count 始终累加——stop_condition.check_repeated_failure 靠它防循环
         """
         if not _is_tool_failure(result):
             return (result, None, None)
 
-        key = _failure_key(tool_name, kwargs, raw_args)
+        default_count_key, recall_key = _operation_key(tool_name, kwargs, raw_args)
+        count_key = op_key if op_key is not None else default_count_key
+        args_hash = _canonical_args_hash(raw_args)
         error_type = _classify_tool_failure(result)
-        entry = self.entries.get(key)
+        entry = self.entries.get(count_key)
 
         if entry is None:
-            # 首次失败：先记录
-            self.entries[key] = FailureEntry(
+            # 首次失败：记录 + 查 backend promoted lesson（用 recall_key）
+            self.entries[count_key] = FailureEntry(
                 failure_count=1,
                 last_error_type=error_type,
                 suggested_next_action=_SUGGESTED_NEXT_ACTION[error_type],
+                last_args_hash=args_hash,
             )
-            # 再问 backend 有没有匹配的 promoted lesson
             if self.lesson_retriever is not None:
                 lesson = self.lesson_retriever.try_recall(
-                    tool_key=key[0], error_type=error_type
+                    tool_key=recall_key, error_type=error_type
                 )
                 if lesson is not None:
                     return (
@@ -150,20 +179,13 @@ class FailureMemory:
                     )
             return (result, None, None)
 
-        # 2nd+ 次失败：更新状态并 augment
+        # 2nd+ 次失败：只累加 failure_count（供 stop_condition loop guard）。
+        # harness-recovery hint 已退役——不再往 tool_result 注入提示文本。
         entry.failure_count += 1
         entry.last_error_type = error_type
         entry.suggested_next_action = _SUGGESTED_NEXT_ACTION[error_type]
-        hint = (
-            f"\n\n[harness-recovery] 同参数已连续失败 {entry.failure_count} 次 "
-            f"(last_error_type={entry.last_error_type})。"
-            f"建议: {entry.suggested_next_action}"
-        )
-        if entry.suggested_next_action == "describe_script" and tool_name == "skill_exec":
-            skill = kwargs.get("skill", "?")
-            script = kwargs.get("script", "?")
-            hint += f'（调用 describe_script(skill="{skill}", script="{script}") 先查 schema）'
-        return (result + hint, entry, None)
+        entry.last_args_hash = args_hash
+        return (result, entry, None)
 
     # ============================================================
     # 给 ReflexionStore 消费的出口
@@ -175,10 +197,10 @@ class FailureMemory:
         shape 与 ReflexionRecord 对齐方便未来 `.to_reflexion_record(trace_id)` 一行转换：
           {tool_key, args_hash, failure_count, last_error_type, suggested_next_action}
         """
-        for (tool_key, args_hash), entry in self.entries.items():
+        for tool_key, entry in self.entries.items():
             yield {
                 "tool_key": tool_key,
-                "args_hash": args_hash,
+                "args_hash": entry.last_args_hash,
                 "failure_count": entry.failure_count,
                 "last_error_type": entry.last_error_type,
                 "suggested_next_action": entry.suggested_next_action,

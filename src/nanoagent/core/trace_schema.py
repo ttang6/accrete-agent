@@ -84,6 +84,17 @@ ACTION_STOP_CONDITION_MET: Final[str] = "stop_condition_met"
 
 
 # ============================================================
+# Circuit breaker 事件（per-op 熔断，禁该 op 本轮、turn 继续）
+# ============================================================
+
+# emit: MainLoop._maybe_trip_breaker, 某 op_key 连续失败达 klass policy 阈值时
+# fields: iteration(int), tool(str), op_key(str), klass(str), failure_count(int),
+#         threshold(int), is_mutating(bool)
+# 语义：该 op 本轮被禁，后续同 op 调用直接回 [熔断] 消息不执行；turn 继续。
+ACTION_CIRCUIT_OPEN: Final[str] = "circuit_open"
+
+
+# ============================================================
 # Loop 结束 / 错误
 # ============================================================
 
@@ -213,6 +224,7 @@ ALL_ACTIONS: Final[frozenset[str]] = frozenset({
     ACTION_COVERAGE_HINT_INJECTED,
     ACTION_FAILURE_RECOVERY_HINT,
     ACTION_STOP_CONDITION_MET,
+    ACTION_CIRCUIT_OPEN,
     ACTION_FINISH,
     ACTION_RUN_ERROR,
     ACTION_EVALUATOR_CALL_START,
