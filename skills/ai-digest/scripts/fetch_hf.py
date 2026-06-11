@@ -7,7 +7,8 @@ LLM 调用：
 流程：
   stdin JSON → 调 HF daily_papers API → 格式化 markdown → stdout
 
-sort 可选值：hot / rising / new。留空使用接口默认排序。
+sort 可选值：hot / rising / new（内部映射到 HF API 当前接受的 trending / publishedAt）。
+留空使用接口默认排序。
 """
 
 import sys
@@ -19,9 +20,9 @@ from _common import ensure_utf8_stdout, print_error, read_args
 HF_DAILY_PAPERS_API = "https://huggingface.co/api/daily_papers"
 HTTP_TIMEOUT = 15
 _SORT_MAP = {
-    "hot": "Hot",
-    "rising": "Rising",
-    "new": "New",
+    "hot": "trending",
+    "rising": "trending",
+    "new": "publishedAt",
 }
 
 

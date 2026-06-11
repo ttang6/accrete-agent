@@ -124,7 +124,10 @@ class LLMClient:
         return rows
 
     def _should_send_temperature(self) -> bool:
-        return self._supports_temperature
+        # gpt-5 / o1 / o3 等 reasoning 系列只接受默认 temperature=1，发任何值都 400；
+        # 它们同时用 max_completion_tokens，故复用该 per-model 判定一并排除——
+        # 修掉 temperature(per-provider) 与 token 参数(per-model) 粒度不一致的漏判。
+        return self._supports_temperature and not self._uses_max_completion_tokens()
 
     def _uses_max_completion_tokens(self) -> bool:
         # max_completion_tokens vs max_tokens 是 per-model-family 区分（按前缀判断），

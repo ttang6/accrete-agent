@@ -60,6 +60,12 @@ PROVIDERS: Dict[str, ProviderConfig] = {
         env_key="DASHSCOPE_API_KEY",
         temperature=True,
     ),
+    # 海外加速端点（同一 DASHSCOPE_API_KEY）——国内端点跨境延迟高时走这条。
+    "dashscope_us": ProviderConfig(
+        base_url="https://dashscope-us.aliyuncs.com/compatible-mode/v1",
+        env_key="DASHSCOPE_API_KEY",
+        temperature=True,
+    ),
     "zhipu": ProviderConfig(
         base_url="https://open.bigmodel.cn/api/paas/v4",
         env_key="ZHIPU_API_KEY",
@@ -68,6 +74,13 @@ PROVIDERS: Dict[str, ProviderConfig] = {
     "deepseek": ProviderConfig(
         base_url="https://api.deepseek.com/v1",
         env_key="DEEPSEEK_API_KEY",
+        temperature=True,
+    ),
+    # Anthropic 官方 OpenAI 兼容端点（用 OpenAI SDK 调 Claude）。
+    # 用途：偏好蒸馏副 LLM 走中立第三方，避免与主 agent 模型同家偏向。
+    "anthropic": ProviderConfig(
+        base_url="https://api.anthropic.com/v1",
+        env_key="ANTHROPIC_API_KEY",
         temperature=True,
     ),
     "ollama": ProviderConfig(
