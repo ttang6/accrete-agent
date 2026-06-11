@@ -58,9 +58,9 @@ def grade_trace(
 
     # 最后一份 trace 决定 task 终态
     finish_reason = _extract_finish_reason(last_events)
-    success = finish_reason == "finish"
     coverage_missing = _extract_last_coverage_missing(last_events)
-    final_answer_chars = _extract_final_answer_chars(last_events)
+    final_answer_text = _extract_final_answer_text(last_events)
+    final_answer_chars = len(final_answer_text)
 
     # 累加全部 trace 的计数指标
     def _sum_action(action: str) -> int:
@@ -72,6 +72,35 @@ def grade_trace(
     # expected_tool_calls 用所有 events union 匹配（任一 trace 命中即算 hit）
     union_events: List[Dict[str, Any]] = [e for _, ev in valid for e in ev]
 
+    obligations_violations = _sum_action(ts.ACTION_OBLIGATION_VIOLATION)
+    expected_tool_calls_hit = _count_expected_tool_calls(
+        union_events, spec.expected_tool_calls
+    )
+    expected_tool_calls_required = len(spec.expected_tool_calls)
+
+    # end-state scoring（看产物，不看路径）：success 不再只看"是否正常结束"，
+    # 而是联合已有过程指标——必须正常 finish + 声明的 coverage 全达标 +
+    # obligation 无违约 + 声明的必需能力全部成功命中。指标集不变，只是把过程
+    # 指标提为成败门槛（doc §6 部分信用/看产物）。expected_* 为空的字段不约束。
+    # H-2 防护（盲点研究 §H）：声明了 success_keywords 时，终答须命中至少一个才算成功
+    # ——堵"空 action=mark 也能 finish+hit 但没真产出"的漏洞（看产物不看路径）。
+    # 例外：R4_unrecoverable / observed_empty 的成功 = 优雅诚实收尾，不该靠精确关键词
+    # 卡死（措辞太散，pilot 实测误杀了 finish 正常的降级卷）；这两类主信号本就是
+    # finish_reason / 步数，故跳过关键词门。trace 终答截断到 500 字。
+    if spec.recovery_type in ("R4_unrecoverable", "observed_empty"):
+        keyword_ok = True
+    else:
+        keyword_ok = (not spec.success_keywords) or any(
+            kw in final_answer_text for kw in spec.success_keywords
+        )
+    success = (
+        finish_reason == "finish"
+        and not coverage_missing
+        and obligations_violations == 0
+        and expected_tool_calls_hit == expected_tool_calls_required
+        and keyword_ok
+    )
+
     return TaskScore(
         task_id=spec.id,
         success=success,
@@ -82,11 +111,9 @@ def grade_trace(
         tool_failures=sum(_count_tool_failures(ev) for _, ev in valid),
         obligations_required=len(spec.expected_obligations),
         obligations_repair_injected=_sum_action(ts.ACTION_OBLIGATION_REPAIR_INJECTED),
-        obligations_violations=_sum_action(ts.ACTION_OBLIGATION_VIOLATION),
-        expected_tool_calls_hit=_count_expected_tool_calls(
-            union_events, spec.expected_tool_calls
-        ),
-        expected_tool_calls_required=len(spec.expected_tool_calls),
+        obligations_violations=obligations_violations,
+        expected_tool_calls_hit=expected_tool_calls_hit,
+        expected_tool_calls_required=expected_tool_calls_required,
         lesson_uses=_sum_action(ts.ACTION_LESSON_USED),
         lesson_helped=_sum_outcome("helped"),
         lesson_hurt=_sum_outcome("hurt"),
@@ -95,6 +122,8 @@ def grade_trace(
         final_answer_chars=final_answer_chars,
         duration_ms=sum(_extract_duration(ev) for _, ev in valid),
         trace_path=str(last_path),
+        total_tokens=sum(_extract_tokens(ev) for _, ev in valid),
+        recovery_type=spec.recovery_type,
     )
 
 
@@ -145,6 +174,7 @@ def _empty_score(spec: TaskSpec, trace_path: str, reason: str) -> TaskScore:
         final_answer_chars=0,
         duration_ms=0,
         trace_path=trace_path,
+        recovery_type=spec.recovery_type,
     )
 
 
@@ -199,11 +229,17 @@ def _count_tool_failures(events: List[Dict[str, Any]]) -> int:
 def _count_expected_tool_calls(
     events: List[Dict[str, Any]], expected: List[Dict[str, Any]]
 ) -> int:
-    """命中 spec.expected_tool_calls 模式的去重计数（每模式至少 1 次算 1 命中）。
+    """命中 spec.expected_tool_calls 模式的去重计数（每模式至少 1 次**成功**调用算 1 命中）。
 
     模式字段：
     - tool: 必填，匹配 trace event 的 tool 字段
     - skill / script: 可选，对 skill_exec 调用解 input JSON 比对
+
+    "成功"判定（end-state scoring，看产物）：output 命中失败签名的 tool_call_end
+    不算命中。这样"必需能力"必须**至少成功执行一次**——
+    - 堵 route-around：agent 用 fetch 绕过 fetch_github，则 fetch_github 永不命中；
+    - 逼真正恢复：注入只 fail 首次调用，agent 必须重试拿到一次成功调用才算命中。
+    被注入打掉的那次失败调用本身不计入命中。
     """
     if not expected:
         return 0
@@ -219,6 +255,8 @@ def _count_expected_tool_calls(
                 continue
             if e.get("tool") != tool:
                 continue
+            if _is_tool_failure(e.get("output") or ""):
+                continue  # 失败调用不算"成功命中"
             if skill is None and script is None:
                 hit_count += 1
                 break
@@ -257,15 +295,27 @@ def _extract_last_coverage_missing(events: List[Dict[str, Any]]) -> List[str]:
     return [str(m) for m in missing if isinstance(m, (str, int))]
 
 
-def _extract_final_answer_chars(events: List[Dict[str, Any]]) -> int:
-    """ACTION_FINISH event 的 output 字段长度（trace 里截断到 500，所以上限 500）。
+def _extract_final_answer_text(events: List[Dict[str, Any]]) -> str:
+    """ACTION_FINISH event 的 output 文本（trace 里截断到 500 字）。
 
-    >500 答案在 trace 里看不到完整长度。eval 用 500 作为"内容相关"信号阈值即可。
+    供 final_answer_chars（取 len）与 success_keywords 命中判定共用。
+    >500 字的答案 trace 里只到 500，关键词须落在前 500 字内。
     """
     finish_events = [e for e in events if e.get("action") == ts.ACTION_FINISH]
     if not finish_events:
-        return 0
-    return len(finish_events[-1].get("output") or "")
+        return ""
+    return str(finish_events[-1].get("output") or "")
+
+
+def _extract_tokens(events: List[Dict[str, Any]]) -> int:
+    """run_summary.tokens（本 trace 的 token 总量）；缺则 0。"""
+    summary = next((e for e in events if e.get("type") == "run_summary"), None)
+    if summary and "tokens" in summary:
+        try:
+            return int(summary["tokens"])
+        except (TypeError, ValueError):
+            return 0
+    return 0
 
 
 def _extract_duration(events: List[Dict[str, Any]]) -> int:

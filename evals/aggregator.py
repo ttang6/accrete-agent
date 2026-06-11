@@ -76,6 +76,10 @@ def aggregate(scores: List[TaskScore]) -> dict[str, Any]:
         for tid, trials in by_task.items()
     }
 
+    # 按 recovery_type 分桶（盲点研究 PaladinEval §3：各类故障 agent 行为不同，
+    # 混在一起会掩盖最弱的那类）。空 recovery_type 归到 "unlabeled" 桶。
+    by_recovery_type = _bucket_by_recovery_type(scores)
+
     return {
         # 任务级（n = trials 总数；total_unique_tasks = 去重 fixture 数）
         "total_tasks": n,
@@ -137,9 +141,36 @@ def aggregate(scores: List[TaskScore]) -> dict[str, Any]:
         "avg_final_answer_chars": total_final_chars / n,
         # Coverage
         "coverage_missing_union": coverage_missing_union,
+        # 按 recovery_type 分桶（R1-R4 各自 success/steps/max_iter/飞轮）
+        "by_recovery_type": by_recovery_type,
         # Per-task 导出（供 diff_report 做 task 维度对比）
         "per_task": [_score_to_row(s) for s in scores],
     }
+
+
+def _bucket_by_recovery_type(scores: List[TaskScore]) -> dict[str, Any]:
+    """按 recovery_type 把 scores 分桶，每桶报 success/步数/max_iter/飞轮信号。
+
+    让 OLD-vs-NEW 的 Δ 能精确到"哪类故障提升最大"，而非一个混合数字。
+    """
+    buckets: dict[str, List[TaskScore]] = {}
+    for s in scores:
+        buckets.setdefault(s.recovery_type or "unlabeled", []).append(s)
+    out: dict[str, Any] = {}
+    for rtype, group in buckets.items():
+        m = len(group) or 1
+        max_iter = sum(1 for s in group if s.finish_reason == "max_iter")
+        out[rtype] = {
+            "n": len(group),
+            "success_rate": sum(1 for s in group if s.success) / m,
+            "avg_steps": sum(s.total_steps for s in group) / m,
+            "max_iter_share": max_iter / m,
+            "avg_tool_failures": sum(s.tool_failures for s in group) / m,
+            "lesson_use_rate": sum(1 for s in group if s.lesson_uses > 0) / m,
+            "lesson_helped": sum(s.lesson_helped for s in group),
+            "lesson_hurt": sum(s.lesson_hurt for s in group),
+        }
+    return out
 
 
 def _empty_summary() -> dict[str, Any]:
@@ -179,6 +210,7 @@ def _empty_summary() -> dict[str, Any]:
         "lesson_ineffective_rate": 0.0,
         "avg_final_answer_chars": 0.0,
         "coverage_missing_union": [],
+        "by_recovery_type": {},
         "per_task": [],
     }
 

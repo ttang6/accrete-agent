@@ -221,6 +221,12 @@ def _build_harness_for_eval(mode: str):
         lesson_retriever=lesson_retriever if mode == "evolved" else None,
     )
 
+    # eval-only 失败注入：实例级猴补 loop 的 ToolRegistry.execute（生产零改动）。
+    # baseline/evolved 两臂都装——两臂面对同一组注入失败，差异只在 recall on/off。
+    # 未 set_fixture（如旧 fixture 无 inject_failures）时全程 no-op。
+    from evals.failure_injection import INJECTOR
+    INJECTOR.install(loop.tool_registry)
+
     store = SessionStore(persist_dir=cli_main.SESSION_DIR)
     user_facts = UserFacts(cli_main.USER_FACTS_PATH)
     audit_cb = (
@@ -257,21 +263,35 @@ def _run_one_task_real(harness, spec: TaskSpec) -> TaskScore:
     if spec.skill:
         harness.handle(f"/skill {spec.skill}")
 
+    # 装入本 trial 的失败注入规格（计数器随之复位）；finally 复位为 no-op。
+    # 计数按"每次 _run_one_task_real 调用"复位 → on_call 语义是 per-trial，
+    # pass^k 的 k 次 trial 各自看到同一注入序列。
+    from evals.failure_injection import INJECTOR
+    INJECTOR.set_fixture(spec.inject_failures)
+
     queries = [spec.query] if isinstance(spec.query, str) else list(spec.query)
     trace_paths: List[Path] = []
-    for q in queries:
-        try:
-            harness.handle(q)
-        except Exception as e:  # noqa: BLE001
-            last = str(trace_paths[-1]) if trace_paths else ""
-            return _error_score(spec, last, f"harness exception: {e}")
-        tracer = getattr(harness._loop, "_tracer", None)
-        tp = getattr(tracer, "_trace_path", None) if tracer else None
-        if tp:
-            path = Path(tp)
-            # 同一 session 内连续多轮可能复用同一 trace 文件，去重避免双计
-            if not trace_paths or trace_paths[-1] != path:
-                trace_paths.append(path)
+    try:
+        for q in queries:
+            try:
+                harness.handle(q)
+            except Exception as e:  # noqa: BLE001
+                last = str(trace_paths[-1]) if trace_paths else ""
+                return _error_score(spec, last, f"harness exception: {e}")
+            tracer = getattr(harness._loop, "_tracer", None)
+            tp = getattr(tracer, "_trace_path", None) if tracer else None
+            if tp:
+                path = Path(tp)
+                # 同一 session 内连续多轮可能复用同一 trace 文件，去重避免双计
+                if not trace_paths or trace_paths[-1] != path:
+                    trace_paths.append(path)
+        # A-3（盲点研究 §A）：声明了 inject_failures 却一次都没触发 → 这张卷"没踩到坑"，
+        # 它的成败无意义。在 clear 计数前抓 fired() 自检，warn 出来供 curate/调参定位。
+        if spec.inject_failures and not INJECTOR.fired():
+            print(f"[eval] ⚠️ {spec.id}: inject_failures 声明了但本 trial 一次都没触发"
+                  f"（target 可能 agent 压根没调到——检查 query/on_call）")
+    finally:
+        INJECTOR.clear_fixture()
 
     if not trace_paths:
         return _error_score(spec, "", "no trace_path")
@@ -300,7 +320,21 @@ def _error_score(spec: TaskSpec, trace_path: str, reason: str) -> TaskScore:
         final_answer_chars=0,
         duration_ms=0,
         trace_path=trace_path or f"<error:{reason}>",
+        recovery_type=spec.recovery_type,
     )
+
+
+# ============================================================
+# pass^k 策略（按 tier）
+# ============================================================
+
+# tier → pass^k：单轮 ^1、一般多轮 ^2、长多轮 ^3（Eval v2 加权方案）。
+PASS_K_BY_TIER: dict[str, int] = {"single": 1, "multi": 2, "long_multi": 3}
+
+
+def pass_k_for_tier(spec: TaskSpec) -> int:
+    """按 spec.tier 决定 pass^k。未知 tier 回退为 1。"""
+    return PASS_K_BY_TIER.get(spec.tier, 1)
 
 
 # ============================================================

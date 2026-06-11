@@ -33,6 +33,14 @@ class TaskSpec:
     - max_iterations: 单 task 上限（超过判 success=False, reason="max_iter"）
     - max_duration_s: 单 task 时长上限（subprocess timeout 兜底）
     - success_keywords: final answer 软匹配关键词（任一命中算"内容相关"）
+    - tier: 难度档 single | multi | long_multi —— 决定 pass^k（eval-only，agent 看不到）。
+        未显式给时由 query 类型回退：str → single，List[str] → multi。
+    - inject_failures: 确定性失败注入规格列表（eval-only，agent 看不到）。每条 dict：
+        {target: "skill:ai-digest/fetch_rss" | "tool:arxiv",
+         on_call: 第 N 次匹配调用时失败（int, 从 1 起）,
+         mode: timeout|rate_limit|malformed|unavailable|schema_mismatch,
+         recovers_to: 可选，标注期望恢复方式（分析/部分信用用，注入器不消费）}
+        由 evals/failure_injection.py 解释执行；生产路径 inject_failures 恒为空 → no-op。
     """
     id: str
     description: str
@@ -44,6 +52,9 @@ class TaskSpec:
     max_iterations: int = 25
     max_duration_s: int = 300
     success_keywords: List[str] = field(default_factory=list)
+    tier: str = "single"
+    inject_failures: List[dict] = field(default_factory=list)
+    recovery_type: str = ""  # R1_transient/R2_switch_source/R3_arg_fix/R4_unrecoverable/observed_empty（eval-only 元数据，供 aggregator 分桶）
 
 
 @dataclass(frozen=True)
@@ -69,6 +80,8 @@ class TaskScore:
     final_answer_chars: int
     duration_ms: int
     trace_path: str
+    total_tokens: int = 0       # run_summary.tokens 累加（成本指标）
+    recovery_type: str = ""     # 从 spec 透传，供 aggregator 按 R1-R4 分桶报告
 
     @property
     def obligation_completion_rate(self) -> float:
@@ -131,6 +144,9 @@ def load_task_spec(yaml_path: Path) -> TaskSpec:
             raise ValueError(f"{yaml_path}: query 是空 list")
     else:
         query = str(raw_query)
+    # tier 未显式给时按 query 类型回退（向后兼容旧 fixture：单轮→single，多轮→multi）
+    default_tier = "multi" if isinstance(query, list) else "single"
+    tier = str(data.get("tier") or default_tier)
     return TaskSpec(
         id=str(data.get("id") or yaml_path.stem),
         description=str(data.get("description", "")),
@@ -141,7 +157,12 @@ def load_task_spec(yaml_path: Path) -> TaskSpec:
         expected_coverage=list(data.get("expected_coverage") or []),
         max_iterations=int(data.get("max_iterations", 25)),
         max_duration_s=int(data.get("max_duration_s", 300)),
-        success_keywords=list(data.get("success_keywords") or []),
+        # str 化：YAML 里裸数字（年份 / arxiv id 如 2404.19756）会被解析成 int/float，
+        # 下游 " ".join 与 `kw in answer` 都要求 str —— 入口统一强转，杜绝类型炸。
+        success_keywords=[str(k) for k in (data.get("success_keywords") or [])],
+        tier=tier,
+        inject_failures=list(data.get("inject_failures") or []),
+        recovery_type=str(data.get("recovery_type") or ""),
     )
 
 
