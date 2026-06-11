@@ -3,9 +3,13 @@
 跟踪 operation_key（意图级）的失败次数 + 错误类型 + 下一步建议。
 计数 key = operation_key（skill 脚本=`skill_exec:skill/script`；fetch 按 host；其余=tool_name），
 不含 args_hash（args_hash 降级为 entry 内 debug metadata）。
-`[harness-recovery]` hint 已退役——2nd+ 次失败不再注入任何提示文本；只保留
+`[harness-recovery]` hint 已退役——2nd+ 次失败默认不注入提示文本；保留
 failure_count（供 stop_condition.check_repeated_failure 防循环 loop guard 读）。
 1st 次失败的 lesson 召回（[runtime-lesson]）保留——那是飞轮通道，不是 harness-recovery。
+可选 `online_reflector`（在线微反思）：同意图（recall_key）第 2 次失败且飞轮
+无可召回的 suggested_action 时，副 LLM 基于报错产一个 [online-reflector] 修复
+假设注入——覆盖"飞轮产不出修复教训"的 hard-tail（默认不装配，开关见 main.py）。
+触发计数特意用意图级而非 op_key（带 args-hash）：换参重试仍失败才最需要外脑。
 
 入门友好视角：
 - 一个 turn（MainLoop.run）创建一份 FailureMemory，run 结束就扔掉
@@ -50,7 +54,15 @@ if TYPE_CHECKING:
     # 避免运行时循环依赖：lesson_retriever 顶层 import schema/backend，
     # 而 failure_memory 是 runtime 顶层 module，不应被 evolution 依赖
     from nanoagent.evolution.runtime_memory.lesson_retriever import LessonRetriever
+    from nanoagent.evolution.runtime_memory.online_reflector import (
+        OnlineReflector,
+        ReflectorSuggestion,
+    )
     from nanoagent.evolution.runtime_memory.schema import RuntimeLesson
+
+
+# 每 turn 在线微反思调用上限（计尝试次数，含 fail-open 返 None 的）
+_REFLECTOR_MAX_CALLS_PER_TURN: Final[int] = 2
 
 
 # ============================================================
@@ -124,6 +136,17 @@ class FailureMemory:
     entries: dict[str, FailureEntry] = field(default_factory=dict)  # key = operation_key
     # Optional["LessonRetriever"] 字面量化避免运行时 import 循环
     lesson_retriever: Optional["LessonRetriever"] = None
+    # 在线微反思（可选）：同意图第 2 次失败且飞轮无 suggested_action 时产修复假设。
+    # 触发计数用 recall_key（意图级，skill_exec:skill/script）而非 op_key（带
+    # args-hash）——模型"换着参数重试仍失败"恰恰是最需要外脑的时刻，按 op_key
+    # 计数会把每次变参当新 op、永远凑不满 2 次（冒烟实测踩到）。
+    online_reflector: Optional["OnlineReflector"] = None
+    reflector_calls: int = 0
+    intent_failures: dict[str, int] = field(default_factory=dict)  # key = recall_key
+    reflector_fired: set = field(default_factory=set)  # 已触发过的 recall_key
+    # 最近一次注入的 suggestion，main_loop 读后清空（发 REFLECTOR_HINT trace 用；
+    # 不改 maybe_augment 的 3 元组返回签名，调用方 / eval monkeypatch 无感）
+    pending_reflector_event: Optional["ReflectorSuggestion"] = None
 
     def maybe_augment(
         self, tool_name: str, kwargs: dict, raw_args: str, result: str,
@@ -135,9 +158,12 @@ class FailureMemory:
           - 成功调用 → (result, None, None) 不动
           - 首次失败 + backend 命中 → (augmented_result, None, lesson) [runtime-lesson] 注入
           - 首次失败 + backend 未命中 → (result, None, None) 只记录不 augment
-          - 2nd+ 次失败 → (result, entry, None) 只累加 failure_count，不注入任何 hint
+          - 2nd+ 次失败 → (result, entry, None) 累加 failure_count
             （harness-recovery 已退役；entry 非 None 仅供 main_loop 发
-            FAILURE_RECOVERY_HINT 重复失败 telemetry trace）
+            FAILURE_RECOVERY_HINT 重复失败 telemetry trace）；同意图失败 ≥2 次且
+            online_reflector 装配且飞轮无修复时，result 可能附 [online-reflector]
+            假设（见 _maybe_reflect），suggestion 存 pending_reflector_event
+            供 main_loop 读后清空
 
         计数键（count_key）：优先用工具自声明的 `op_key`（main_loop 从
         `tool.op_key(kwargs)` 取，是熔断器也会用的同一把键——单一计数源不漂移）；
@@ -157,10 +183,11 @@ class FailureMemory:
         count_key = op_key if op_key is not None else default_count_key
         args_hash = _canonical_args_hash(raw_args)
         error_type = _classify_tool_failure(result)
+        self.intent_failures[recall_key] = self.intent_failures.get(recall_key, 0) + 1
         entry = self.entries.get(count_key)
 
         if entry is None:
-            # 首次失败：记录 + 查 backend promoted lesson（用 recall_key）
+            # 首次失败（按 op_key）：记录 + 查 backend promoted lesson（用 recall_key）
             self.entries[count_key] = FailureEntry(
                 failure_count=1,
                 last_error_type=error_type,
@@ -177,15 +204,61 @@ class FailureMemory:
                         None,
                         lesson,
                     )
-            return (result, None, None)
+            # 换 args 重试仍失败 → op_key 是新 entry 但意图级已 ≥2 次，微反思照触发
+            hint = self._maybe_reflect(recall_key, count_key, error_type, raw_args, result)
+            return (result + hint if hint else result, None, None)
 
-        # 2nd+ 次失败：只累加 failure_count（供 stop_condition loop guard）。
-        # harness-recovery hint 已退役——不再往 tool_result 注入提示文本。
+        # 2nd+ 次失败（同 op_key）：累加 failure_count（供 stop_condition loop guard）。
+        # harness-recovery hint 已退役；唯一可能的注入是在线微反思。
         entry.failure_count += 1
         entry.last_error_type = error_type
         entry.suggested_next_action = _SUGGESTED_NEXT_ACTION[error_type]
         entry.last_args_hash = args_hash
-        return (result, entry, None)
+        hint = self._maybe_reflect(recall_key, count_key, error_type, raw_args, result)
+        return (result + hint if hint else result, entry, None)
+
+    def _maybe_reflect(
+        self, recall_key: str, count_key: str, error_type: str,
+        raw_args: str, result: str,
+    ) -> Optional[str]:
+        """微反思触发判定：满足全部条件时调副 LLM 产假设、返回 hint 文本。
+
+        条件：装配了 reflector + 同意图（recall_key）失败 ≥2 次 + 该意图未触发过
+        + 每 turn 调用上限未到 + 飞轮无可召回的 suggested_action。
+        无论副 LLM 是否产出，触发即记入 fired/calls（失败的尝试不重试）。
+        """
+        if self.online_reflector is None:
+            return None
+        if self.intent_failures.get(recall_key, 0) < 2:
+            return None
+        if recall_key in self.reflector_fired:
+            return None
+        if self.reflector_calls >= _REFLECTOR_MAX_CALLS_PER_TURN:
+            return None
+        if self._flywheel_has_repair(recall_key, error_type):
+            return None
+        self.reflector_fired.add(recall_key)
+        self.reflector_calls += 1
+        suggestion = self.online_reflector.try_suggest(
+            tool_key=count_key, raw_args=raw_args, error_output=result,
+        )
+        if suggestion is None:
+            return None
+        self.pending_reflector_event = suggestion
+        return self.online_reflector.format_hint(suggestion)
+
+    def _flywheel_has_repair(self, recall_key: str, error_type: str) -> bool:
+        """backend 里是否已有带 suggested_action 的可召回 lesson。
+
+        有 → 飞轮自己能给修复（首次失败已注入过），微反思不抢戏；
+        无 / retriever 未装配 / lesson 只有泛建议没有修复 → 微反思上场。
+        """
+        if self.lesson_retriever is None:
+            return False
+        lesson = self.lesson_retriever.try_recall(
+            tool_key=recall_key, error_type=error_type
+        )
+        return lesson is not None and lesson.suggested_action is not None
 
     # ============================================================
     # 给 ReflexionStore 消费的出口

@@ -133,6 +133,13 @@ ACTION_EVALUATOR_RETRY_TRIGGERED: Final[str] = "evaluator_retry_triggered"
 # fields: iteration(int), tool(str), lesson_id(str), error_class(str), confidence(float)
 ACTION_LESSON_USED: Final[str] = "lesson_used"
 
+# emit: MainLoop._augment_with_failure_memory, FailureMemory 第 2 次同 op 失败
+#       触发 OnlineReflector 且产出 suggestion 时
+# fields: iteration(int), tool(str), diagnosis(str, 截断), has_suggested_args(bool)
+# 语义：在线微反思注入了 [online-reflector] 修复假设（未验证；采纳与否由主 LLM
+# 决定，下一次工具调用即环境验证）。复盘 / 小测用此事件量 hint→重试成功率。
+ACTION_REFLECTOR_HINT: Final[str] = "reflector_hint"
+
 
 # ============================================================
 # ToolCallRepairGate 事件（schema 校验前置拦截）
@@ -231,6 +238,7 @@ ALL_ACTIONS: Final[frozenset[str]] = frozenset({
     ACTION_EVALUATOR_CALL_END,
     ACTION_EVALUATOR_RETRY_TRIGGERED,
     ACTION_LESSON_USED,
+    ACTION_REFLECTOR_HINT,
     ACTION_TOOL_CALL_REPAIR_REQUIRED,
     ACTION_OBLIGATION_REPAIR_INJECTED,
     ACTION_OBLIGATION_VIOLATION,

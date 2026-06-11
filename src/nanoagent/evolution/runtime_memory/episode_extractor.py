@@ -109,11 +109,16 @@ class EpisodeExtractor:
 
         # iteration -> 最近一次 tool_call_start，用于配对 tool_call_end 拿 args
         last_call_by_iter: Dict[Tuple[int, str], Dict[str, Any]] = {}
-        # (iteration, tool) -> 结构化 repair_example dict（main_loop
-        # _apply_repair_gate 已抽好放进 ACTION_TOOL_CALL_REPAIR_REQUIRED 事件）。
-        # tool_call_end 的 output 含同源的 example_call JSON 块，但截断/格式
-        # 漂移会破坏文本重解析；从专用 trace 事件直接读 dict 最稳。
-        repair_example_by_iter: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        # (iteration, tool) -> ACTION_TOOL_CALL_REPAIR_REQUIRED 事件原文
+        # （main_loop _apply_repair_gate 已抽好 repair_example / required_fields）。
+        # tool_call_end 的 output 含同源信息，但截断/格式漂移会破坏文本重解析；
+        # 从专用 trace 事件直接读 dict 最稳。
+        repair_event_by_iter: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        # 运行期修复配对材料：tool 失败的 (出现序号, FailureEvent) + 成功调用的
+        # (出现序号, tool, raw_input)。失败之后同 tool_key 换参成功 = 观测到的修复。
+        tool_fail_seq: List[Tuple[int, FailureEvent]] = []
+        success_seq: List[Tuple[int, str, str]] = []
+        seq = 0
 
         for ev in body:
             action = ev.get("action")
@@ -122,20 +127,24 @@ class EpisodeExtractor:
                 continue
 
             if action == ACTION_TOOL_CALL_REPAIR_REQUIRED:
-                example = ev.get("repair_example")
-                if isinstance(example, dict):
-                    repair_example_by_iter[
-                        (ev.get("iteration", -1), ev.get("tool", ""))
-                    ] = example
+                repair_event_by_iter[
+                    (ev.get("iteration", -1), ev.get("tool", ""))
+                ] = ev
                 continue
 
             if action == ACTION_TOOL_CALL_END:
+                seq += 1
                 output = ev.get("output", "") or ""
                 if _is_tool_failure(output):
                     fe = _build_tool_failure(
-                        ev, last_call_by_iter, repair_example_by_iter
+                        ev, last_call_by_iter, repair_event_by_iter
                     )
                     failures.append(fe)
+                    tool_fail_seq.append((seq, fe))
+                else:
+                    success_seq.append(
+                        (seq, ev.get("tool", ""), ev.get("input", "") or "")
+                    )
                 continue
 
             if action == ACTION_COVERAGE_CHECK:
@@ -158,6 +167,8 @@ class EpisodeExtractor:
 
         if not failures:
             return None
+
+        _attach_runtime_repairs(tool_fail_seq, success_seq)
 
         episode_id = _episode_id(trace_path, header.get("started_at", ""))
         return RuntimeEpisode(
@@ -197,10 +208,52 @@ class EpisodeExtractor:
 # ============================================================
 
 
+def _attach_runtime_repairs(
+    tool_fail_seq: List[Tuple[int, FailureEvent]],
+    success_seq: List[Tuple[int, str, str]],
+) -> None:
+    """运行期修复配对：失败之后同 tool_key 换参成功 → 成功调用入 repair_example。
+
+    E-v2 校验期 repair_example（RepairGate 事件）向运行期的推广——修复样例的来源
+    从"schema 校验后的合法重调"扩展到"任意失败后被观测到的成功恢复"。谁促成的
+    成功不区分（自愈 / lesson 召回 / 在线微反思），只认 trace 事实。
+
+    规则（全部通用，无 skill / 工具名知识）：
+    - 键 = `_build_tool_key`（与 lesson 存储同键）；成功必须出现在失败之后
+    - 成功 args 必须与失败 args 不同（同参成功 = transient 抖动，不是修复）
+    - 校验期 repair 事件已填的 repair_example 优先，不覆盖（它更精确）
+    - 已知精度边界：粗键工具（如 fetch 的键就是裸 "fetch"）可能把"换了个目标
+      成功"配成修复；hint 渲染端的"参数值按当前任务替换"标注是现有缓解
+    """
+    if not tool_fail_seq or not success_seq:
+        return
+    parsed_successes = []
+    for s_seq, tool, raw in success_seq:
+        try:
+            parsed = json.loads(raw) if raw else None
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            parsed_successes.append(
+                (s_seq, _build_tool_key(tool, raw), _canonical_args_hash(raw), parsed)
+            )
+    if not parsed_successes:
+        return
+    for f_seq, fe in tool_fail_seq:
+        if isinstance(fe.extras, dict) and fe.extras.get("repair_example"):
+            continue  # 校验期来源优先
+        for s_seq, s_key, s_hash, s_args in parsed_successes:
+            if s_seq > f_seq and s_key == fe.tool_key and s_hash != fe.args_hash:
+                if fe.extras is None:
+                    fe.extras = {}
+                fe.extras["repair_example"] = s_args
+                break
+
+
 def _build_tool_failure(
     end_ev: Dict[str, Any],
     last_call_by_iter: Dict[Tuple[int, str], Dict[str, Any]],
-    repair_example_by_iter: Optional[
+    repair_event_by_iter: Optional[
         Dict[Tuple[int, str], Dict[str, Any]]
     ] = None,
 ) -> FailureEvent:
@@ -215,12 +268,17 @@ def _build_tool_failure(
             raw_args = start_ev.get("input", "") or ""
     output = end_ev.get("output", "") or ""
     extras: Dict[str, Any] = {"raw_input": raw_args[:200]}
-    # 结构化 repair_example dict 经 extras 流到 LessonGenerator →
-    # LessonEvidence.repair_example + RuntimeLesson.suggested_action
-    if repair_example_by_iter is not None:
-        example = repair_example_by_iter.get((iteration, tool))
-        if isinstance(example, dict):
-            extras["repair_example"] = example
+    # 结构化 repair_example / required_fields 经 extras 流到 LessonGenerator →
+    # LessonEvidence.repair_example + RuntimeLesson.suggested_action / cause_sig
+    if repair_event_by_iter is not None:
+        repair_ev = repair_event_by_iter.get((iteration, tool))
+        if isinstance(repair_ev, dict):
+            example = repair_ev.get("repair_example")
+            if isinstance(example, dict):
+                extras["repair_example"] = example
+            required_fields = repair_ev.get("required_fields")
+            if isinstance(required_fields, list) and required_fields:
+                extras["required_fields"] = required_fields
     # 通用 semantic_failures pass-through：
     # 任何 skill script 输出 JSON 含顶级 `semantic_failures: [...]` 字段时，
     # 抽进 extras 给 LessonGenerator。framework 不识别 failure_type 的具体值，

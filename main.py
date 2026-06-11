@@ -26,6 +26,7 @@ from nanoagent.evolution.skill_preference_audit import SkillPreferenceAuditWrite
 from nanoagent.evolution.skill_preference_store import SkillPreferenceStore
 from nanoagent.evolution.runtime_memory.lesson_ingestor import LessonIngestor
 from nanoagent.evolution.runtime_memory.lesson_retriever import LessonRetriever
+from nanoagent.evolution.runtime_memory.online_reflector import OnlineReflector
 from nanoagent.evolution.runtime_memory.outcome_tracker import OutcomeTracker
 from nanoagent.evolution.runtime_memory.promotion_audit import JsonlAuditWriter
 from nanoagent.evolution.runtime_memory.promotion_gate import PromotionGate
@@ -76,6 +77,14 @@ EVALUATOR_PROVIDER: str = "dashscope"
 EVALUATOR_TIMEOUT: int = 15  # 秒；副 LLM 超过即 fail-open 走 finalize
 EVALUATOR_MAX_RETRIES: int = 1  # advisor 原话"非常小但非常硬"，一次 retry 足够
 
+# 在线微反思（docs/81 铁律修正案）：第 2 次同 op 失败且飞轮无可召回的
+# suggested_action 时，副 LLM 基于报错产一个 [online-reflector] 修复假设。
+# 默认关：未经小测验证 + eval 可比性；DASHSCOPE_API_KEY 缺失也自然降级。
+ONLINE_REFLECTOR_MODEL: str = "qwen3.6-flash"
+ONLINE_REFLECTOR_PROVIDER: str = "dashscope"
+ONLINE_REFLECTOR_TIMEOUT: int = 15
+ONLINE_REFLECTOR_EXTRA_BODY: Optional[dict] = {"enable_thinking": False}
+
 # 持久化路径
 CLI_SESSION_KEY: str = "cli:default"
 SESSION_DIR: Path = Path("data/runtime/sessions")
@@ -116,6 +125,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 ENABLE_LESSON_RECALL: bool = _env_bool("NANOAGENT_ENABLE_LESSON_RECALL", True)  # Phase C：第 1 次失败时也查 backend 中的 promoted lesson
+ENABLE_ONLINE_REFLECTOR: bool = _env_bool("NANOAGENT_ONLINE_REFLECTOR", False)  # 在线微反思，默认关（待小测验证）
 # 滑窗失败率总闸（Track A-b.4）。默认开（生产兜底）。Track E eval 关掉：实测它在 R2
 # 上抢在熔断器降级完成前掐断、抹平熔断收益（详见 main_loop 注释）。
 ENABLE_FAILURE_RATE_GATE: bool = _env_bool("NANOAGENT_ENABLE_FAILURE_RATE_GATE", True)
@@ -360,6 +370,18 @@ def build_loop(
     counter, store, budget_cfg = build_context_hygiene()
     contracts = [skill_loader.get_contract(n) for n in skill_loader.list_skills()]
     coverage_specs = aggregate_coverage_specs(contracts) or None
+    online_reflector = None
+    if ENABLE_ONLINE_REFLECTOR and os.getenv("DASHSCOPE_API_KEY"):
+        reflector_llm = LLMClient(
+            model=ONLINE_REFLECTOR_MODEL,
+            provider=ONLINE_REFLECTOR_PROVIDER,
+            instance_name="online_reflector",
+            timeout=ONLINE_REFLECTOR_TIMEOUT,
+            extra_body=ONLINE_REFLECTOR_EXTRA_BODY,
+        )
+        online_reflector = OnlineReflector(llm=reflector_llm)
+        print(f"[OnlineReflector] enabled: {ONLINE_REFLECTOR_PROVIDER}/"
+              f"{ONLINE_REFLECTOR_MODEL} (timeout={ONLINE_REFLECTOR_TIMEOUT}s)")
     return MainLoop(
         name="assistant",
         llm=llm,
@@ -368,6 +390,7 @@ def build_loop(
         coverage_specs=coverage_specs,
         enable_failure_rate_gate=ENABLE_FAILURE_RATE_GATE,
         lesson_retriever=lesson_retriever,
+        online_reflector=online_reflector,
         token_counter=counter,
         tool_output_store=store,
         context_budget_config=budget_cfg,

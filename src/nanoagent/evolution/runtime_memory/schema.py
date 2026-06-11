@@ -142,6 +142,8 @@ class LessonTrigger:
     coverage_gap / soft_quality_issue 类不绑工具，task_type 等 router 接入再填。
     `failure_count_gte` 默认 1；只有 repeated_same_args_failure 模板会设 2。
     `scope` 用 string 不用 enum，留 "global" / "agent:<name>" / "skill:<name>" 扩展余地。
+    `condition_hint`：一句话适用条件（模板确定性生成），召回注入时随 hint
+    渲染，声明经验边界；旧 payload_json 无此字段时默认空串。
     """
 
     error_class: str
@@ -149,6 +151,7 @@ class LessonTrigger:
     tool_name: Optional[str] = None
     failure_count_gte: int = 1
     scope: str = "global"
+    condition_hint: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -225,10 +228,11 @@ class LessonStats:
 class RuntimeLesson:
     """一条 conditional lesson。从 episode + error_class 用模板生成。
 
-    `lesson_id` = sha1(error_class + tool_key + args_hash)[:16] —— **语义键**：
-    同一种失败模式（不同 trace、不同 episode 但同 error_class + tool + args_hash）
+    `lesson_id` = sha1(error_class + tool_key + cause_sig)[:16] —— **原因层语义键**：
+    同一种失败原因（不同 trace、不同参数，但同 error_class + tool + 原因签名）
     共享同一 lesson_id；跨 trace 的 evidence 累加靠 backend `extend_lesson_evidence`，
-    `evidence.source_episode_ids` 是 list 即为支持这种聚合。
+    `evidence.source_episode_ids` 是 list 即为支持这种聚合。args_hash 只留在
+    evidence 作实例证据，不参与键。
     """
 
     lesson_id: str

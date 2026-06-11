@@ -134,14 +134,17 @@ class LessonRetriever:
 
         格式与现有 [harness-recovery] 通道平行：
             [runtime-lesson] {recommendation} (lesson_id=xxx, conf=0.75)
-            [structured-repair-hint] {json}     ← 可选
+            [适用条件] {trigger.condition_hint}     ← 可选（非空时）
+            [structured-repair-hint]（示例标注） {json}     ← 可选
 
         recommendation 硬截断到 `_HINT_MAX_RECOMMENDATION_CHARS`（300 char），
         防止超长 lesson 绕过 MainLoop 的 max_tool_output_chars 把 context 撑爆。
         MainLoop 在 augment 之前已对 raw tool_result 截断；这里负责把追加部分
         也限制在受控范围内。
 
-        lesson.suggested_action 非 None 时附加结构化修复块。
+        lesson.suggested_action 非 None 时附加结构化修复块。示例来自历史失败
+        现场，参数值是当时任务的——标注语提醒 LLM 结构照用、值按当前任务替换
+        （防照抄旧实例值帮倒忙）。
         只在失败现场召回时注入（FailureMemory.maybe_augment 路径），不进
         常驻 system prompt——避免长 JSON 污染 prompt cache。
         """
@@ -152,6 +155,9 @@ class LessonRetriever:
             f"\n\n[runtime-lesson] {rec} "
             f"(lesson_id={lesson.lesson_id}, conf={lesson.confidence:.2f})"
         ]
+        condition = (lesson.trigger.condition_hint or "").strip()
+        if condition:
+            parts.append(f"\n[适用条件] {condition[:200]}")
         if lesson.suggested_action is not None:
             try:
                 action_json = json.dumps(
@@ -160,5 +166,9 @@ class LessonRetriever:
             except (TypeError, ValueError):
                 action_json = ""
             if action_json:
-                parts.append(f"\n[structured-repair-hint]\n{action_json}")
+                parts.append(
+                    "\n[structured-repair-hint]"
+                    "（历史同类失败的修复示例：结构照用，具体参数值按当前任务替换）"
+                    f"\n{action_json}"
+                )
         return "".join(parts)

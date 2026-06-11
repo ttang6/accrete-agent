@@ -79,6 +79,7 @@ class MainLoop(BaseAgent):
                  repeat_failure_threshold: int = DEFAULT_REPEAT_FAILURE_THRESHOLD,
                  enable_failure_rate_gate: bool = True,
                  lesson_retriever=None,
+                 online_reflector=None,
                  token_counter: Optional[TokenCounter] = None,
                  tool_output_store: Optional[ToolOutputStore] = None,
                  context_budget_config: Optional[ContextBudgetConfig] = None,
@@ -92,6 +93,8 @@ class MainLoop(BaseAgent):
             CoverageCategorySpec 列表（duck-typed 避免 main_loop 反向 import skills.contract）。
             None 时 CoverageChecker 退化为无 category 检查（framework 不内建 skill 知识）
         lesson_retriever: 非 None 时第 1 次失败也查 backend promoted lesson
+        online_reflector: 非 None 时第 2 次同 op 失败且飞轮无修复建议时注入
+            [online-reflector] 修复假设（OnlineReflector，默认不装配）
         token_counter: None 时构造默认（cl100k_base + chars/4 fallback）
         tool_output_store: None 时退化到 inline `[:max_tool_output_chars]` 截断
         context_budget_config: None 时仅保留 chars/4 单点 warning，不做 budget 检查
@@ -111,6 +114,7 @@ class MainLoop(BaseAgent):
         # 也掐掉 → 抹平熔断器收益。Track E 关掉它，让 per-op 熔断器单独说话。
         self._enable_failure_rate_gate = enable_failure_rate_gate
         self._lesson_retriever = lesson_retriever
+        self._online_reflector = online_reflector
         # token_counter 默认构造一份（cl100k_base，tiktoken 不可用时自动 fallback）
         self._token_counter = token_counter if token_counter is not None else TokenCounter()
         self._tool_output_store = tool_output_store
@@ -203,6 +207,7 @@ class MainLoop(BaseAgent):
             coverage_thresholds=self._coverage_thresholds,
             coverage_specs=self._coverage_specs,
             lesson_retriever=self._lesson_retriever,
+            online_reflector=self._online_reflector,
         )
         if pending_action_contracts:
             self._turn_ctx.obligation_tracker.register(pending_action_contracts)
@@ -332,10 +337,17 @@ class MainLoop(BaseAgent):
         if not (isinstance(result, str) and result.startswith("[tool-call-repair-required]")):
             return
         validation_error = ""
-        for line in result.split("\n", 5)[1:6]:
+        required_fields = None
+        for line in result.split("\n", 6)[1:7]:
             if line.startswith("validation_error:"):
                 validation_error = line[len("validation_error:"):].strip()[:200]
-                break
+            elif line.startswith("required_fields:"):
+                try:
+                    parsed = json.loads(line[len("required_fields:"):].strip())
+                except (json.JSONDecodeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, list):
+                    required_fields = parsed[:10]
         repair_example = _extract_repair_example(result)
         self._trace(
             action=ts.ACTION_TOOL_CALL_REPAIR_REQUIRED, iteration=iteration,
@@ -343,6 +355,7 @@ class MainLoop(BaseAgent):
             skill=c["kwargs"].get("skill", ""),
             script=c["kwargs"].get("script", ""),
             validation_error=validation_error,
+            required_fields=required_fields,
             repair_example=repair_example,
         )
 
@@ -381,6 +394,15 @@ class MainLoop(BaseAgent):
                 lesson_id=used_lesson.lesson_id,
                 error_class=used_lesson.trigger.error_class,
                 confidence=used_lesson.confidence,
+            )
+        suggestion = self._turn_ctx.failure_memory.pending_reflector_event
+        if suggestion is not None:
+            self._turn_ctx.failure_memory.pending_reflector_event = None
+            self._trace(
+                action=ts.ACTION_REFLECTOR_HINT, iteration=iteration,
+                tool=c["name"],
+                diagnosis=suggestion.diagnosis[:200],
+                has_suggested_args=suggestion.suggested_args is not None,
             )
         return augmented_result
 

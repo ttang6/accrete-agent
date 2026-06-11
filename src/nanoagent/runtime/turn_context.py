@@ -203,6 +203,7 @@ class TurnContext:
         coverage_thresholds: Optional[dict[str, int]] = None,
         lesson_retriever=None,
         coverage_specs: Optional[List[CoverageCategorySpec]] = None,
+        online_reflector=None,
     ) -> "TurnContext":
         """工厂方法：可选 manifest specs + 可选阈值 override + 可选 backend lesson retriever。
 
@@ -219,6 +220,9 @@ class TurnContext:
         coverage = CoverageChecker(**kwargs)
         return cls(
             coverage=coverage,
-            failure_memory=FailureMemory(lesson_retriever=lesson_retriever),
+            failure_memory=FailureMemory(
+                lesson_retriever=lesson_retriever,
+                online_reflector=online_reflector,
+            ),
             obligation_tracker=ObligationTracker(),
         )

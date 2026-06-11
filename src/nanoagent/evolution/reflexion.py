@@ -25,7 +25,7 @@
 
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -165,16 +165,43 @@ class ReflexionStore:
             _logger.warning(f"clear {path} 失败: {e}")
             return False
 
-    def render_for_skill(self, skill_name: str, n: int = 5) -> str:
+    def render_for_skill(
+        self, skill_name: str, n: int = 5, max_age_days: int = 30
+    ) -> str:
         """把最近 n 条渲染成 markdown 块（无标题，供 SkillLoader 前置拼装）。
 
-        无记录时返回空串；调用方据此判断是否注入。
+        渲染期治理（存储不动，jsonl 仍 append-only 全量保留）：
+        1. 时效：created_at 超过 max_age_days 的不渲染（防过时教训每轮常驻）
+        2. 去重：(error_class, content) 相同的多条只渲染最新一条
+        3. 上限：过滤去重后取最近 n 条
+
+        无记录 / 全部被过滤时返回空串；调用方据此判断是否注入。
         """
-        records = self.read_recent("skill", skill_name, n=n)
+        # 多读一些再过滤，避免"最近 n 条恰好全过期"时漏掉更早的有效记录
+        records = self.read_recent("skill", skill_name, n=n * 4)
         if not records:
             return ""
-        lines = []
+
+        cutoff = datetime.now() - timedelta(days=max_age_days)
+        fresh: list[ReflexionRecord] = []
         for r in records:
+            try:
+                created = datetime.fromisoformat(r.created_at)
+            except (ValueError, TypeError):
+                fresh.append(r)  # 时间戳损坏 → fail-open 保留
+                continue
+            if created >= cutoff:
+                fresh.append(r)
+
+        deduped: dict[tuple, ReflexionRecord] = {}
+        for r in fresh:
+            deduped[(r.error_class, r.content)] = r  # 后写覆盖 → 保最新
+        kept = list(deduped.values())[-n:]
+        if not kept:
+            return ""
+
+        lines = []
+        for r in kept:
             prefix = f"[{r.created_at[:10]}]"
             if r.error_class:
                 prefix += f" [{r.error_class}]"

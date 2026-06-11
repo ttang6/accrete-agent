@@ -32,7 +32,10 @@ from nanoagent.evolution.runtime_memory.backend import (
     MemoryBackend,
 )
 from nanoagent.evolution.runtime_memory.episode_extractor import EpisodeExtractor
-from nanoagent.evolution.runtime_memory.lesson_generator import LessonGenerator
+from nanoagent.evolution.runtime_memory.lesson_generator import (
+    LessonGenerator,
+    _cause_signature,
+)
 from nanoagent.evolution.runtime_memory.trace_error_classifier import (
     TraceErrorClassifier,
 )
@@ -113,6 +116,13 @@ class LessonIngestor:
             try:
                 error_class = self._classifier.classify(fe, episode.failures)
                 lesson = self._generator.generate(episode, fe, error_class)
+                # 键审计：cause_sig 错位（错分类/提取失败）比 args_hash 键更隐蔽，
+                # 留四元组日志可查
+                _logger.info(
+                    f"lesson key: id={lesson.lesson_id} tool={fe.tool_key} "
+                    f"class={error_class} sig={_cause_signature(fe, error_class)!r} "
+                    f"args_hash={fe.args_hash}"
+                )
             except Exception as e:
                 _logger.warning(
                     f"LessonIngestor lesson 生成失败 (episode={episode.episode_id}, "

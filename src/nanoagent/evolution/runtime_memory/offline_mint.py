@@ -33,6 +33,8 @@ from nanoagent.evolution.runtime_memory.backend import (
 )
 from nanoagent.evolution.runtime_memory.episode_extractor import EpisodeExtractor
 from nanoagent.evolution.runtime_memory.lesson_generator import (
+    _cause_signature,
+    _condition_hint,
     _deterministic_lesson_id,
     _now_iso,
 )
@@ -193,8 +195,9 @@ class ReflectorMintRunner:
         self, episode: RuntimeEpisode, fe: FailureEvent,
         error_class: str, result,
     ) -> RuntimeLesson:
+        cause_sig = _cause_signature(fe, error_class)
         lesson_id = _deterministic_lesson_id(
-            error_class=error_class, tool_key=fe.tool_key, args_hash=fe.args_hash,
+            error_class=error_class, tool_key=fe.tool_key, cause_sig=cause_sig,
         )
         now = _now_iso()
         expires_on = (
@@ -203,6 +206,7 @@ class ReflectorMintRunner:
         trigger = LessonTrigger(
             error_class=error_class, tool_name=fe.tool_key,
             failure_count_gte=1, scope=f"agent:{episode.agent_name}",
+            condition_hint=_condition_hint(fe.tool_key, error_class, cause_sig),
         )
         evidence = LessonEvidence(
             source_episode_ids=[episode.episode_id],
@@ -219,7 +223,8 @@ class ReflectorMintRunner:
             trigger=trigger, evidence=evidence,
             created_at=now, updated_at=now, expires_on=expires_on,
             status=LessonStatus.CANDIDATE, stats=LessonStats(), ttl_days=self._ttl_days,
-            tags=[error_class, episode.agent_name, "reflector"],
+            tags=[error_class, episode.agent_name, "reflector"]
+            + ([f"sig:{cause_sig}"] if cause_sig else []),
             suggested_action=result.suggested_action,
         )
 
