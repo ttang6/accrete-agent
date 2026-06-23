@@ -115,6 +115,40 @@ def get_logger(name: str) -> logging.Logger:
 
 
 # ============================================================
+# log_event —— 结构化分级 app 日志（与学习 trace 分流、分目录）
+# ============================================================
+#
+# get_logger 之上的薄封装：写一行结构化 JSON 到 data/logs/app/<date>.jsonl，
+# 物理上与 traces/ 分目录（强化"log 给人排障 / trace 给飞轮学习"的概念分离）。
+# 与 MetricsRegistry 同一条纪律：fire-and-forget、ENABLE_OBSERVABILITY 关则 no-op、
+# 绝不读学习 trace 文件。敏感内容（prompt / 用户原文）不该进 fields，由 caller 把关。
+
+def log_event(event: str, level: int = logging.INFO, **fields: Any) -> None:
+    """记一条结构化事件到 app 日志。event 是事件名，fields 是脱敏后的字段。"""
+    from nanoagent.core.metrics import observability_enabled
+    if not observability_enabled():
+        return
+    try:
+        from nanoagent.core.paths import data_dir
+        entry = {
+            "ts": datetime.now().isoformat(),
+            "level": logging.getLevelName(level),
+            "event": event,
+        }
+        for k, v in fields.items():
+            try:
+                json.dumps(v)
+                entry[k] = v
+            except (TypeError, ValueError):
+                entry[k] = str(v)
+        path = data_dir("logs/app") / f"{datetime.now().strftime('%Y%m%d')}.jsonl"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+# ============================================================
 # RunTracer — Agent 运行轨迹记录
 # ============================================================
 
@@ -167,12 +201,20 @@ class RunTracer:
         self._stream_file.flush()
 
     def step(self, **fields) -> None:
-        """记录一个步骤。常用字段：action, input, output, tool, error。"""
+        """记录一个步骤。常用字段：action, input, output, tool, error。
+
+        `duration_ms` 默认是"距上一事件间隔"（粗略 telemetry）；caller 显式传入
+        `duration_ms`（如操作节点的 perf_counter 真耗时）时以传入值为准，不被间隔覆盖。
+        """
         now = time.time()
+        explicit_duration = fields.pop("duration_ms", None)
         entry = {
             "step": len(self.steps) + 1,
             "timestamp": datetime.now().isoformat(),
-            "duration_ms": round((now - (self._step_start or self._start_time)) * 1000),
+            "duration_ms": (
+                explicit_duration if explicit_duration is not None
+                else round((now - (self._step_start or self._start_time)) * 1000)
+            ),
             **fields,
         }
         self.steps.append(entry)

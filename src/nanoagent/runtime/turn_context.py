@@ -33,7 +33,7 @@ from nanoagent.runtime.failure_memory import (  # noqa: F401
     _is_tool_failure,
     _operation_key,
 )
-from nanoagent.runtime.obligation_tracker import ObligationTracker
+from nanoagent.runtime.context_sources import MARKER_GATE_COVERAGE
 from nanoagent.skills.contract import CoverageCategorySpec
 
 # ============================================================
@@ -147,7 +147,7 @@ class CoverageChecker:
         """若有 missing category，构造一条提示给 LLM；否则 None。
 
         例：missing=['paper', 'oss'] →
-            "[harness-coverage] 当前覆盖未达阈值：paper 0/3, oss 1/2。
+            "[gate-coverage] 当前覆盖未达阈值：paper 0/3, oss 1/2。
              建议补调：fetch_hf / fetch_github（可放宽 max_results 或调整 sort）。"
 
         修复建议来源：spec.suggestion（manifest 声明）→ spec.script（无 suggestion 时）
@@ -168,7 +168,7 @@ class CoverageChecker:
             if sugg:
                 suggestions.append(sugg)
         hint = (
-            "[harness-coverage] 当前覆盖未达阈值："
+            f"{MARKER_GATE_COVERAGE} 当前覆盖未达阈值："
             + ", ".join(parts)
             + "。建议补调："
             + " / ".join(suggestions)
@@ -184,18 +184,22 @@ class CoverageChecker:
 
 @dataclass
 class TurnContext:
-    """MainLoop 每次 run() 构造一份。聚合 coverage + failure_memory + obligation_tracker。
+    """MainLoop 每次 run() 构造一份。聚合 coverage + failure_memory。
 
     disabled_ops：per-op 熔断状态（ephemeral per-turn）。op_key → 已禁用时回给 LLM
-    的 `[熔断]` 消息。run 结束即丢，不持久化（见 circuit_breaker.py）。
+    的 `[gate-circuit-open]` 消息。run 结束即丢，不持久化（见 circuit_breaker.py）。
     tool_outcomes：每次 tool 调用一个 bool（True=失败），供滑窗失败率总闸判定。
     """
 
     coverage: CoverageChecker = field(default_factory=CoverageChecker)
     failure_memory: FailureMemory = field(default_factory=FailureMemory)
-    obligation_tracker: ObligationTracker = field(default_factory=ObligationTracker)
     disabled_ops: dict[str, str] = field(default_factory=dict)
     tool_outcomes: list[bool] = field(default_factory=list)
+    # candidate store：本轮所有 tool 输出的未截断原文，按出现序累加。发布流程的
+    # 出处核对读它——核"日报机器块里的条目 fingerprint 是否真在本轮抓回的候选里"，
+    # 防模型凭空造一条候选集没有的 paper。框架不认"日报"业务，只攒原文；判定在
+    # 发布流程（skill 侧）做。run 结束即丢。
+    candidates: list[str] = field(default_factory=list)
 
     @classmethod
     def create(
@@ -224,5 +228,4 @@ class TurnContext:
                 lesson_retriever=lesson_retriever,
                 online_reflector=online_reflector,
             ),
-            obligation_tracker=ObligationTracker(),
         )

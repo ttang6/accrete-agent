@@ -6,13 +6,16 @@
 """
 
 import json
-import re
+import logging
+import time
 from datetime import datetime
 from typing import Optional
 
 from nanoagent.core.agent import BaseAgent
 from nanoagent.core.message import Message
-from nanoagent.core.logger import RunTracer
+from nanoagent.core.logger import RunTracer, log_event
+from nanoagent.core.metrics import metrics
+from nanoagent.core.prompt_assets import load_prompt
 from nanoagent.core import trace_schema as ts
 from nanoagent.runtime.context_budget import ContextBudget, ContextBudgetConfig
 from nanoagent.runtime.stop_condition import (
@@ -24,32 +27,10 @@ from nanoagent.runtime.stop_condition import (
 from nanoagent.runtime.token_counter import TokenCounter
 from nanoagent.runtime.tool_output_store import ToolOutputStore
 from nanoagent.runtime.failure_memory import _is_tool_failure
+from nanoagent.runtime.tool_failure import classify_tool_failure
 from nanoagent.runtime.circuit_breaker import breaker_threshold, format_breaker_message
+from nanoagent.runtime.context_sources import MARKER_GATE_INVALID_CALL
 from nanoagent.runtime.turn_context import TurnContext
-
-# 从 [tool-call-repair-required] 文本里抽 example_call JSON 块。
-# `_format_repair_text` 里固定写：
-#   example_call:
-#   { ... 4-space indented json ... }
-# 接着是 next_call_must / do_not_repeat 行——所以 JSON 块以平衡花括号闭合，
-# 然后下一非缩进行开始。这里保守 regex：找 `example_call:\n` 后第一个 `{` 开始
-# 到第一个最外层 `}` 闭合的范围；json.loads 失败兜底 None（fail-open，调用方
-# 直接传 None 进 trace 不影响主路径）。
-_EXAMPLE_CALL_RE = re.compile(
-    r"example_call:\s*\n(\{.*?\n\})", re.DOTALL
-)
-
-
-def _extract_repair_example(repair_text: str) -> Optional[dict]:
-    if not repair_text:
-        return None
-    match = _EXAMPLE_CALL_RE.search(repair_text)
-    if match is None:
-        return None
-    try:
-        return json.loads(match.group(1))
-    except (json.JSONDecodeError, ValueError):
-        return None
 
 
 # 默认 system prompt：只告诉 LLM 它是谁，不告诉它该怎么走。
@@ -94,7 +75,7 @@ class MainLoop(BaseAgent):
             None 时 CoverageChecker 退化为无 category 检查（framework 不内建 skill 知识）
         lesson_retriever: 非 None 时第 1 次失败也查 backend promoted lesson
         online_reflector: 非 None 时第 2 次同 op 失败且飞轮无修复建议时注入
-            [online-reflector] 修复假设（OnlineReflector，默认不装配）
+            [learned-fix] 修复假设（OnlineReflector，默认不装配）
         token_counter: None 时构造默认（cl100k_base + chars/4 fallback）
         tool_output_store: None 时退化到 inline `[:max_tool_output_chars]` 截断
         context_budget_config: None 时仅保留 chars/4 单点 warning，不做 budget 检查
@@ -126,7 +107,7 @@ class MainLoop(BaseAgent):
         # 单 turn delta 基准：run() 开头记，finalize 算差值
         self._usage_baseline = None  # type: Optional["TokenUsage"]
         if not self.system_prompt:
-            self.system_prompt = DEFAULT_SYSTEM_PROMPT
+            self.system_prompt = load_prompt("loop_default_system", DEFAULT_SYSTEM_PROMPT)
 
     @staticmethod
     def _dict_to_message(d: dict) -> Message:
@@ -185,17 +166,12 @@ class MainLoop(BaseAgent):
         self,
         messages: list[dict],
         save_on_finish: bool = True,
-        pending_action_contracts: Optional[list] = None,
         **kwargs,
     ) -> str:
         """跑一次主循环。messages 不含 system，MainLoop 自己拼。
 
         save_on_finish=False 时 tracer 保持 open，caller 必须手动 finalize_trace()
-        ——evaluator retry 路径用此模式以让 run_continuation 复用同一 trace 文件。
-
-        pending_action_contracts: RequiredActionGate 输入。Harness 算
-        好用户本轮命中的 ActionContract 列表（duck-typed，main_loop 不 import
-        skills.contract 避免反向依赖）。loop 内部传给 obligation_tracker.register。
+        ——发布轮 critic revise 路径用此模式以让 run_continuation 复用同一 trace 文件。
         """
         log_input = messages[-1].get("content", "") if messages else ""
         convo: list[Message] = [Message.system(self._resolve_system_prompt())]
@@ -209,8 +185,6 @@ class MainLoop(BaseAgent):
             lesson_retriever=self._lesson_retriever,
             online_reflector=self._online_reflector,
         )
-        if pending_action_contracts:
-            self._turn_ctx.obligation_tracker.register(pending_action_contracts)
         if self._context_budget_config is not None:
             self._context_budget = ContextBudget(config=self._context_budget_config)
         else:
@@ -233,6 +207,9 @@ class MainLoop(BaseAgent):
             )
             self._tracer.set_token_summary(self._token_dict())
             self._tracer.save()
+            metrics.incr("run_error_total", error_type=type(e).__name__)
+            log_event("run_error", level=logging.ERROR,
+                      agent=self.name, error_type=type(e).__name__)
             raise
 
         if save_on_finish:
@@ -265,6 +242,9 @@ class MainLoop(BaseAgent):
             )
             self._tracer.set_token_summary(self._token_dict())
             self._tracer.save()
+            metrics.incr("run_error_total", error_type=type(e).__name__)
+            log_event("run_error", level=logging.ERROR,
+                      agent=self.name, error_type=type(e).__name__, continuation=True)
             raise
 
         if save_on_finish:
@@ -275,8 +255,13 @@ class MainLoop(BaseAgent):
         """显式关闭 tracer 并写 token summary；多次调用安全。"""
         if self._tracer is None:
             return
-        self._tracer.set_token_summary(self._token_dict())
+        tok = self._token_dict()
+        self._tracer.set_token_summary(tok)
         self._tracer.save()
+        # turn 结束：本轮 token 直方图 + 落一行 metric 快照（cumulative-since-start）
+        if "run_delta_total" in tok:
+            metrics.observe("tokens_per_turn", tok["run_delta_total"])
+        metrics.dump()
 
     def _current_trace_id(self) -> str:
         """trace 文件 stem（'assistant_153012'），用作 ToolOutputStore 子目录名。
@@ -327,18 +312,21 @@ class MainLoop(BaseAgent):
     # ============================================================
 
     def _apply_repair_gate(self, c: dict, result: str, iteration: int) -> None:
-        """ToolCallRepairGate trace：result 以 [tool-call-repair-required] 前缀
+        """ToolCallRepairGate trace：result 以 [gate-invalid-call] 前缀
         开头时 emit 独立事件给 OutcomeTracker 判 ineffective_application。
 
-        从 result 里 regex 抽 example_call JSON 块写进 repair_example
-        字段，让飞轮下游 episode_extractor → lesson.suggested_action 拿到完整
-        结构化修复示例（不被 fe.error_message[:120] 截断）。
+        从 result 的 `repair_example:` 行直接解析结构化修复示例（与 validation_error /
+        required_fields 同一套按行前缀解析），写进 trace 的 repair_example 字段，
+        让飞轮下游 episode_extractor → lesson.example 拿到完整结构化示例
+        （不被 fe.error_message[:120] 截断）。RepairGate 产出的结构化对象单一来源在
+        `_skill_arg_validator._format_repair_text`，此处只解析、不再 DOTALL 正则往返。
         """
-        if not (isinstance(result, str) and result.startswith("[tool-call-repair-required]")):
+        if not (isinstance(result, str) and result.startswith(MARKER_GATE_INVALID_CALL)):
             return
         validation_error = ""
         required_fields = None
-        for line in result.split("\n", 6)[1:7]:
+        repair_example = None
+        for line in result.split("\n", 7)[1:8]:
             if line.startswith("validation_error:"):
                 validation_error = line[len("validation_error:"):].strip()[:200]
             elif line.startswith("required_fields:"):
@@ -348,7 +336,13 @@ class MainLoop(BaseAgent):
                     parsed = None
                 if isinstance(parsed, list):
                     required_fields = parsed[:10]
-        repair_example = _extract_repair_example(result)
+            elif line.startswith("repair_example:"):
+                try:
+                    parsed = json.loads(line[len("repair_example:"):].strip())
+                except (json.JSONDecodeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    repair_example = parsed
         self._trace(
             action=ts.ACTION_TOOL_CALL_REPAIR_REQUIRED, iteration=iteration,
             tool=c["name"],
@@ -367,16 +361,18 @@ class MainLoop(BaseAgent):
 
         harness-recovery 已退役：2nd+ 次失败不再注入 hint 文本，但仍发
         FAILURE_RECOVERY_HINT trace（重复失败 telemetry，供 episode_extractor /
-        复盘消费）；唯一会改 result 的 augment 通道是首次失败的 [runtime-lesson]。
+        复盘消费）；唯一会改 result 的 augment 通道是首次失败的 [learned-lesson]。
 
         count_key 用工具自声明的 op_key（`tool.op_key(kwargs)`）—— 跟后续熔断器
         同一把键，单一计数源。工具不在 registry（理论上不会）时退回 None，
         maybe_augment 自走 _operation_key 默认投影。"""
         tool = self.tool_registry.get(c["name"])
         op_key = tool.op_key(c["kwargs"]) if tool is not None else None
+        lesson_key = tool.lesson_key(c["kwargs"]) if tool is not None else None
         augmented_result, failure_entry, used_lesson = (
             self._turn_ctx.failure_memory.maybe_augment(
-                c["name"], c["kwargs"], c["raw_args"], result, op_key=op_key
+                c["name"], c["kwargs"], c["raw_args"], result,
+                op_key=op_key, lesson_key=lesson_key,
             )
         )
         if failure_entry is not None:
@@ -408,11 +404,11 @@ class MainLoop(BaseAgent):
 
     def _maybe_trip_breaker(self, c: dict, result: str, iteration: int) -> str:
         """per-op 熔断：失败的 op 连续失败达 klass policy 阈值 → 禁本轮 + 在 result
-        末尾追加 [熔断] 消息让 LLM 立刻看到。
+        末尾追加 [gate-circuit-open] 消息让 LLM 立刻看到。
 
         计数读 FailureMemory.entries（_augment_with_failure_memory 已按同一把
         op_key 计过，单一计数源不漂移）；klass/is_mutating 读 tool.classify_failure。
-        已禁的 op（再次失败或被禁后回的 [熔断] 消息）不重复 trip。"""
+        已禁的 op（再次失败或被禁后回的 [gate-circuit-open] 消息）不重复 trip。"""
         if not (isinstance(result, str) and _is_tool_failure(result)):
             return result
         tool = self.tool_registry.get(c["name"])
@@ -433,6 +429,9 @@ class MainLoop(BaseAgent):
             tool=c["name"], op_key=tf.op_key, klass=tf.klass or "",
             failure_count=count, threshold=threshold, is_mutating=tf.is_mutating,
         )
+        metrics.incr("circuit_open_total", tool=c["name"])
+        log_event("circuit_open", level=logging.WARNING, tool=c["name"],
+                  op_key=tf.op_key, klass=tf.klass or "", failure_count=count)
         return result + "\n\n" + msg
 
     def _observe_coverage(
@@ -446,17 +445,54 @@ class MainLoop(BaseAgent):
                 tool=c["name"], category=obs[0], running_max=obs[1],
             )
 
-    def _track_obligation(self, c: dict, augmented_result: str) -> None:
-        """RequiredActionGate post-tool 钩子：通知 ObligationTracker 检查是否
-        满足某 obligation。失败的 call 不算 satisfy。"""
-        output_is_failure = (
-            isinstance(augmented_result, str)
-            and _is_tool_failure(augmented_result)
+    def _emit_tool_op_node(
+        self, c: dict, augmented_result: str, failed: bool,
+        duration_ms: Optional[int], iteration: int,
+    ) -> None:
+        """span-as-node：把一次 tool 调用写成**一个**结构化操作节点（取代旧的
+        tool_call_start + tool_call_end 两事件配对）。
+
+        节点携带热路径能拿到的结构化字段——`status / op_key / klass / error_type /
+        is_mutating` + **真耗时 duration_ms**（perf_counter，区别于 trace 默认的
+        "距上一事件间隔"）。这些以前"算了又扔"（tf 只在熔断时落 ACTION_CIRCUIT_OPEN）。
+        `error_class`(5 类) / `cause_sig` 是冷路径——需 episode 全量上下文
+        （TraceErrorClassifier / _cause_signature），不在热路径单 op 视角内算，留 episode 侧。
+
+        失败时再调一次 `tool.classify_failure`（纯字符串分析、廉价）取 klass/is_mutating，
+        与熔断器各取所需、不强行穿线 tf；`error_type` 用 tool_failure 的粗 substring 分类。
+        """
+        tool = self.tool_registry.get(c["name"])
+        op_key = tool.op_key(c["kwargs"]) if tool is not None else c["name"]
+        # lesson_key（粗键）随节点携带——冷路径 episode_extractor 直接读，不再 _build_tool_key 重算（F1）
+        lesson_key = tool.lesson_key(c["kwargs"]) if tool is not None else c["name"]
+        klass = ""
+        is_mutating = False
+        error_type = ""
+        if failed:
+            error_type = classify_tool_failure(augmented_result)
+            if tool is not None:
+                tf = tool.classify_failure(c["kwargs"], augmented_result)
+                klass = tf.klass or ""
+                is_mutating = tf.is_mutating
+        self._trace(
+            action=ts.ACTION_TOOL_CALL_END, iteration=iteration,
+            tool=c["name"], input=c["raw_args"][:200],
+            output=augmented_result[:300],
+            status="failed" if failed else "ok",
+            op_key=op_key, lesson_key=lesson_key, klass=klass, error_type=error_type,
+            is_mutating=is_mutating, duration_ms=duration_ms,
         )
-        self._turn_ctx.obligation_tracker.notice_tool_call(
-            tool=c["name"], kwargs=c["kwargs"],
-            output_is_failure=output_is_failure,
+        # metric sink（step2：读节点已算好的结构化字段，不在调用点重算）。失败按
+        # error_type 分桶（低基数：transient/schema_mismatch/unknown），便于看"失败构成"；
+        # 真耗时直方图是 4a 真 duration 才有的新指标。labels 只取低基数字段——
+        # op_key/duration 等高基数字段留 trace，不进 metric 标签。
+        metrics.incr(
+            "tool_call_total", tool=c["name"],
+            status="failed" if failed else "ok",
+            error_type=error_type if failed else "",
         )
+        if duration_ms is not None:
+            metrics.observe("tool_op_latency_ms", duration_ms, tool=c["name"])
 
     def _check_stop_condition(
         self, messages: list[Message], iteration: int
@@ -482,6 +518,9 @@ class MainLoop(BaseAgent):
             reason=stop_decision.reason.value,
             details=stop_decision.details,
         )
+        metrics.incr("stop_condition_total", reason=stop_decision.reason.value)
+        log_event("stop_condition_met", level=logging.WARNING,
+                  reason=stop_decision.reason.value)
         self._trace(
             action=ts.ACTION_FINISH, iterations=iteration,
             reason=stop_decision.reason.value,
@@ -489,54 +528,6 @@ class MainLoop(BaseAgent):
         )
         self._last_messages_snapshot = [m.to_dict() for m in messages]
         return forced_msg
-
-    def _apply_required_action_gate(
-        self, messages: list[Message], response, iteration: int
-    ) -> Optional[str]:
-        """RequiredActionGate pre-finish 检查：未满足 obligation 时 inject 一次
-        repair message 强制再一轮 LLM；已 repair 过仍不满足 → emit violation
-        允许 finish（防死循环）。
-
-        返回值：
-        - "continue" → caller 应 continue（已注入 repair，messages 已 mutate）
-        - None → caller 走 finish 流程（可能含 violation trace）
-        """
-        tracker = self._turn_ctx.obligation_tracker
-        if tracker.has_unsatisfied():
-            repair = tracker.build_repair_message()
-            if repair is not None:
-                ids = [o.id for o in tracker.unsatisfied()]
-                tracker.mark_repair_emitted()
-                # assistant 当前回答先入 history（LLM 看到自己说什么）
-                messages.append(Message(
-                    role="assistant",
-                    content=response.content or "",
-                ))
-                messages.append(Message.user(repair))
-                self._trace(
-                    action=ts.ACTION_OBLIGATION_REPAIR_INJECTED,
-                    iteration=iteration,
-                    obligation_ids=ids,
-                )
-                self._log(
-                    f"[Iter {iteration}] → 注入 RequiredActionGate repair: {ids}",
-                )
-                return "continue"
-
-        # 已 repair 过仍不满足 → 记 violation 但允许 finish（防死循环）
-        still_open = tracker.all_unsatisfied_including_repaired()
-        if still_open:
-            self._trace(
-                action=ts.ACTION_OBLIGATION_VIOLATION,
-                iteration=iteration,
-                obligation_ids=[o.id for o in still_open],
-            )
-            self._log(
-                f"[Iter {iteration}] → obligation violation, finish anyway: "
-                f"{[o.id for o in still_open]}",
-                level="warning",
-            )
-        return None
 
     def _run_inner(
         self, messages: list[Message], tool_schemas: list[dict]
@@ -585,6 +576,7 @@ class MainLoop(BaseAgent):
             self._log(f"[Iter {iteration}] → calling LLM (messages={len(messages)}, ~{ctx_tokens_est:,} tokens)...")
             self._trace(action=ts.ACTION_LLM_CALL_START, iteration=iteration,
                         messages_count=len(messages))
+            _llm_t0 = time.perf_counter()
             response = self.llm.think_with_tools(
                 messages=[m.to_dict() for m in messages],
                 tools=tool_schemas,
@@ -592,6 +584,11 @@ class MainLoop(BaseAgent):
             )
             self._trace(action=ts.ACTION_LLM_CALL_END, iteration=iteration,
                         has_tool_calls=bool(response.tool_calls))
+            # metric sink（sibling to trace，form A）：调用量 + 真耗时（perf_counter，
+            # 区别于 trace 的 interval duration）。fire-and-forget，关 observability 即 no-op。
+            _model = getattr(self.llm, "model", "?")
+            metrics.incr("llm_call_total", model=_model, status="ok")
+            metrics.observe("llm_call_latency_ms", (time.perf_counter() - _llm_t0) * 1000, model=_model)
 
             # ---- 分支：LLM 决定调工具 vs 直接回答 ----
             if response.tool_calls:
@@ -635,7 +632,7 @@ class MainLoop(BaseAgent):
                             f"可用: {self.tool_registry.list_tools()}"
                         )
                     else:
-                        # per-op 熔断：该 op 本轮已被禁 → 不执行，直接回 [熔断] 消息，
+                        # per-op 熔断：该 op 本轮已被禁 → 不执行，直接回 [gate-circuit-open] 消息，
                         # 交回 LLM 换路子（turn 继续）。
                         disabled_msg = self._turn_ctx.disabled_ops.get(
                             self.tool_registry.get(tool_name).op_key(tool_kwargs)
@@ -652,21 +649,24 @@ class MainLoop(BaseAgent):
                     })
 
                     self._log(f"  → {tool_name}({raw_args[:80]})")
-                    self._trace(action=ts.ACTION_TOOL_CALL_START, iteration=iteration,
-                                tool=tool_name, input=raw_args[:200])
+                    # tool_call_start 已退役（v3 阶段四-4a）：一次调用塌成单个操作节点
+                    # （见 _emit_tool_op_node），不再 start/end 两事件靠 (iteration,tool) 配回去。
 
-                # ---- 执行：单个顺序，多个并发 ----
+                # ---- 执行：单个顺序，多个并发（各自计 perf_counter 真耗时）----
                 runnable = [c for c in call_plan if c["error"] is None]
                 results_by_index: dict[int, str] = {}
+                durations_by_index: dict[int, Optional[int]] = {}
 
                 if len(runnable) <= 1:
                     for c in runnable:
                         idx = call_plan.index(c)
+                        _t0 = time.perf_counter()
                         results_by_index[idx] = self.tool_registry.execute(
                             c["name"], **c["kwargs"]
                         )
+                        durations_by_index[idx] = round((time.perf_counter() - _t0) * 1000)
                 else:
-                    # execute_parallel 内部 asyncio + 线程池，已处理异常隔离
+                    # execute_parallel 内部 asyncio + 线程池，已处理异常隔离 + 各 task 计时
                     parallel_calls = [
                         {"name": c["name"], "kwargs": c["kwargs"]}
                         for c in runnable
@@ -675,6 +675,7 @@ class MainLoop(BaseAgent):
                     for c, r in zip(runnable, parallel_results):
                         idx = call_plan.index(c)
                         results_by_index[idx] = r["result"]
+                        durations_by_index[idx] = r.get("duration_ms")
 
                 # ---- 组装每个工具结果，统一截断、trace end、追加到 messages ----
                 for idx, c in enumerate(call_plan):
@@ -730,16 +731,20 @@ class MainLoop(BaseAgent):
                     augmented_result = self._maybe_trip_breaker(
                         c, augmented_result, iteration
                     )
-                    # 记一笔 tool 结果成败，供滑窗失败率总闸判定（[熔断] 消息本身
+                    # 记一笔 tool 结果成败，供滑窗失败率总闸判定（[gate-circuit-open] 消息本身
                     # 非失败 → 不计入，避免被禁 op 的重复调用稀释失败率）
-                    self._turn_ctx.tool_outcomes.append(_is_tool_failure(augmented_result))
+                    _failed = _is_tool_failure(augmented_result)
+                    self._turn_ctx.tool_outcomes.append(_failed)
+                    # 攒进 candidate store 供发布流程出处核对（仅成功输出有意义）
+                    if not _failed and isinstance(augmented_result, str):
+                        self._turn_ctx.candidates.append(augmented_result)
                     self._observe_coverage(c, augmented_result, iteration)
-                    self._track_obligation(c, augmented_result)
 
                     self._log(f"  {c['name']} → {augmented_result[:100]}", level="debug")
-                    self._trace(action=ts.ACTION_TOOL_CALL_END, iteration=iteration,
-                                tool=c["name"], input=c["raw_args"][:200],
-                                output=augmented_result[:300])
+                    self._emit_tool_op_node(
+                        c, augmented_result, _failed,
+                        durations_by_index.get(idx), iteration,
+                    )
 
                     messages.append(Message.tool_result(
                         content=augmented_result,
@@ -747,19 +752,12 @@ class MainLoop(BaseAgent):
                         tool_name=c["name"],
                     ))
 
-                # 本 iter tool 落完后若仍有 missing category，注入 synthetic user 提示。
-                # counts 非空只在观察过成功 coverage tool 后——首次失败 / 非 ai-digest 都不触发
-                if self._turn_ctx.coverage.counts:
-                    hint = self._turn_ctx.coverage.build_hint()
-                    if hint is not None:
-                        messages.append(Message.user(hint))
-                        self._trace(action=ts.ACTION_COVERAGE_HINT_INJECTED, iteration=iteration,
-                                    missing=self._turn_ctx.coverage.missing_categories(),
-                                    counts=dict(self._turn_ctx.coverage.counts),
-                                    observed_empty=sorted(self._turn_ctx.coverage.observed_empty))
+                # coverage synthetic 注入已退役（v3 阶段三-2b）：覆盖度从硬闸降为
+                # SKILL.md body 软方法论 + critic 非阻断评审。CoverageChecker 仍在
+                # _observe_coverage 里 emit ACTION_COVERAGE_CHECK（留 trace/metrics 观测），
+                # 只是不再回灌 [gate-coverage] hint 逼 LLM 补 fetch。
 
                 # 结构化 stop：同参数连续失败超阈值强制退出。
-                # 放在 coverage_hint 之后是为了让 hint 已注入到 trace（方便复盘判因果）
                 forced_msg = self._check_stop_condition(messages, iteration)
                 if forced_msg is not None:
                     return forced_msg
@@ -767,13 +765,8 @@ class MainLoop(BaseAgent):
                 continue
 
             else:
-                # RequiredActionGate：LLM 想 finish 前检查未满足 obligation。
-                # gate 返回 "continue" 时本 iter 已注入 repair → 走下一轮 LLM
-                if self._apply_required_action_gate(messages, response, iteration) == "continue":
-                    continue
-
-                # LLM 直接回答 → 结束。tracer.save() 由 caller 负责（让 evaluator
-                # retry 路径能复用同一个 tracer）
+                # LLM 直接回答 → 结束。tracer.save() 由 caller 负责（让发布轮
+                # critic revise 路径能复用同一个 tracer）
                 last_content = response.content or ""
                 self._log(f"[Iter {iteration}] → 直接回答 ({len(last_content)} 字)")
                 self._trace(action=ts.ACTION_FINISH, iterations=iteration,

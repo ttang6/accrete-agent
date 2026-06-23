@@ -1,5 +1,6 @@
 """Channel-agnostic user-turn orchestrator."""
 
+import hashlib
 import logging
 import secrets
 from dataclasses import dataclass
@@ -8,10 +9,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Optional
 
 from nanoagent.core import trace_schema as ts
+from nanoagent.core.metrics import metrics
 from nanoagent.core.paths import data_dir
 from nanoagent.memory.user_facts import UserFacts
-from nanoagent.runtime.evaluator import DigestEvaluator
+from nanoagent.runtime.critic import Critic
 from nanoagent.runtime.main_loop import MainLoop
+from nanoagent.runtime.publish import (
+    check_provenance,
+    extract_adopted_items,
+    mark_published_items,
+)
 from nanoagent.runtime.session import SessionStore
 from nanoagent.runtime.token_counter import TokenCounter
 from nanoagent.skills.loader import SkillLoader
@@ -30,7 +37,11 @@ if TYPE_CHECKING:
 _logger = logging.getLogger("nanoagent.harness")
 
 # 不能作为 /<skill> 快捷命令使用。
-_RESERVED_SLASH_CMDS = frozenset({"clear", "new", "sessions", "resume", "skill", "skills", "profile", "feedback"})
+_RESERVED_SLASH_CMDS = frozenset({"clear", "new", "sessions", "resume", "skill", "skills", "profile", "feedback", "digest"})
+
+# /digest 发布日报时跑的 skill 与合成任务（发布是确定性命令入口，不靠自然语言猜意图）。
+_DIGEST_SKILL = "ai-digest"
+_DIGEST_TASK = "生成今日 AI 日报。"
 
 # /feedback 单 skill 上限，超出 FIFO 丢最旧——避免 SKILL.md 前置块无限膨胀。
 _FEEDBACK_MAX_PER_SKILL = 20
@@ -86,8 +97,8 @@ class Harness:
         session_key: str,
         base_identity: str,
         digests_dir: Optional[Path] = None,
-        evaluator: Optional[DigestEvaluator] = None,
-        evaluator_max_retries: int = 1,
+        critic: Optional[Critic] = None,
+        critic_max_revise: int = 1,
         outcome_tracker: Optional["OutcomeTracker"] = None,
         lesson_ingestor: Optional["LessonIngestor"] = None,
         promotion_gate: Optional["PromotionGate"] = None,
@@ -105,8 +116,9 @@ class Harness:
         self._session_key = session_key
         self._base_identity = base_identity
         self._digests_dir = digests_dir
-        self._evaluator = evaluator
-        self._evaluator_max_retries = evaluator_max_retries
+        # critic：发布流程里的质量评审子 agent（非阻断、最多触发一轮 revise）。
+        self._critic = critic
+        self._critic_max_revise = critic_max_revise
         self._outcome_tracker = outcome_tracker
         # trace 写完后扫 failure 自动产 candidate lesson 入 backend
         # None 时退化到旧行为（仅手动 backfill 能造 candidate）
@@ -181,6 +193,14 @@ class Harness:
         if text == "/sessions":
             return self._list_sessions()
 
+        if text.startswith("/sessions "):
+            arg = text.split(None, 1)[1].strip()
+            if arg == "all":
+                return self._list_sessions(limit=None)
+            if arg.isdigit() and int(arg) > 0:
+                return self._list_sessions(limit=int(arg))
+            return self._sys("用法：/sessions [all | <n>]；默认显示最近 10 个")
+
         if text == "/resume":
             return self._sys("用法：/resume <session_key>；可先用 /sessions 查看可选 key")
 
@@ -211,6 +231,9 @@ class Harness:
             self._current_skill = name
             self._store.set_meta(self._session_key, current_skill=name)
             return self._sys(f"已切入 skill: {name}")
+
+        if text == "/digest":
+            return self._handle_digest()
 
         if text == "/profile" or text.startswith("/profile "):
             return self._handle_profile(text)
@@ -288,18 +311,30 @@ class Harness:
         self._fresh_session_pending = False
         return self._sys(f"已切回 {target_key}")
 
-    def _list_sessions(self) -> HarnessResponse:
-        rows = self._store.list_sessions()
+    def _list_sessions(self, limit: Optional[int] = 10) -> HarnessResponse:
+        """默认只列最近 limit 个；limit=None 列全部。
+
+        历史会话能攒到上千条（实测 1700+），无上限直接刷屏。默认折叠到最近 10，
+        `/sessions all` 展开、`/sessions <n>` 自定数量、再 `/sessions` 即收回。
+        """
+        rows = self._store.list_sessions()  # 已按 last_used_at 倒序
         if not rows:
             return self._sys("(暂无会话)")
+        total = len(rows)
+        shown = rows if limit is None else rows[:limit]
         lines = ["session 列表（按最近使用倒序）："]
-        for r in rows:
+        for r in shown:
             marker = "*" if r["key"] == self._session_key else " "
             title = r["title"] or "(no title)"
             last = r["last_used_at"] or "-"
             lines.append(
                 f" {marker} [{r['key']}] turns={r['turn_count']} "
                 f"last={last}  {title}"
+            )
+        if limit is not None and total > limit:
+            lines.append(
+                f"…仅显示最近 {limit}/{total} 个。"
+                "/sessions all 看全部；/sessions <n> 看最近 n 个"
             )
         lines.append("用 /resume <key> 切回；/new 开新会话")
         return self._sys("\n".join(lines))
@@ -544,7 +579,7 @@ class Harness:
     # 对话路径
     # ============================================================
 
-    def _handle_dialogue(self, text: str) -> HarnessResponse:
+    def _handle_dialogue(self, text: str, *, publish: bool = False) -> HarnessResponse:
         # 启动后首条对话消息：默认开新 session，避免无意识续上次。
         # /resume / /new / /clear 已显式表态过则 _fresh_session_pending=False，跳过。
         # 保留 _current_skill 跨 fork：如果用户在 fresh 状态显式 /skill X，
@@ -556,27 +591,21 @@ class Harness:
         base_history = history.get_history() if history is not None else []
         turn_messages = base_history + [{"role": "user", "content": text}]
 
-        # RequiredActionGate：从所有声明 contract 的 skill 里匹配
-        # 用户本轮 lexical_hints 命中的 action_contracts，注入 loop.run 用于
-        # finish 前的 obligation 检查。无任何 skill 声明 contract → 空列表，
-        # loop 行为完全不变（向后兼容）。
-        pending_contracts = self._collect_matched_action_contracts(text)
-
         # Session 记账基准：本轮跑前快照累计用量，turn 结束算 delta。
         # run_bot 多 chat 共享同一 llm 实例，但单 worker 串行执行 → 本轮"前→后"
         # 差值仍只反映本轮（不被其他 chat 干扰）。
         usage_before = self._loop.llm.usage.snapshot()
 
-        defer_save = self._evaluator is not None
+        # 发布轮可能触发一轮 critic revise（复用同一 tracer），故延后 trace 落盘。
+        defer_save = publish and self._critic is not None
         answer = self._loop.run(
             messages=turn_messages,
             save_on_finish=not defer_save,
-            pending_action_contracts=pending_contracts,
         )
 
         if defer_save:
             try:
-                answer = self._maybe_run_evaluator_retry(answer, turn_messages)
+                answer = self._maybe_critic_revise(answer, turn_messages)
             finally:
                 self._loop.finalize_trace()
 
@@ -590,7 +619,10 @@ class Harness:
         self._store.append_turn(self._session_key, text, answer)
         token_delta = self._loop.llm.usage.total_tokens - usage_before.total_tokens
         notice = self._update_session_meta_after_turn(text, token_delta)
-        self._maybe_archive_digest(answer)
+        # 发布副作用只在发布轮跑：抽机器块条目 → 出处核对 → 自动 mark → archive。
+        # 非发布轮（随手查）什么副作用都不跑，结构上杜绝污染去重历史。
+        if publish:
+            self._run_publish_sideeffects(answer)
         self._maybe_distill(event="turn_end")
         content = answer if notice is None else f"{answer}\n\n{notice}"
         return HarnessResponse(
@@ -732,6 +764,9 @@ class Harness:
                         new_confidence=u.new_confidence,
                         new_hit_count=u.new_hit_count,
                     )
+                    # metric sink：飞轮 helped/hurt/ineffective 分桶（派生率交 metric 层
+                    # 暴露、不重算——outcome_tracker 已算好 confidence）
+                    metrics.incr("lesson_outcome_total", outcome=u.outcome.value)
                 _logger.info(
                     f"[OutcomeTracker] 更新 {len(updates)} 条 lesson outcome: "
                     + ", ".join(f"{u.lesson_id}({u.outcome.value},conf={u.new_confidence:.2f})"
@@ -740,163 +775,90 @@ class Harness:
         except Exception as e:
             _logger.warning(f"OutcomeTracker 处理 trace 异常（已 fail-open）: {e}")
 
-    def _collect_matched_action_contracts(self, user_text: str) -> list:
-        """跨所有 skill 收集本轮命中的 action_contracts（lexical_hints 子串匹配）。
+    def _handle_digest(self) -> HarnessResponse:
+        """`/digest` 命令：确定性发布入口。把 ai-digest 设为本轮 skill，跑合成的
+        "生成今日 AI 日报"任务并带 publish=True，触发发布流程。走命令而非自然语言
+        识别——不让 harness 去猜"这句是不是要正式日报"（那会重开 lexical 那条老缝）。"""
+        if _DIGEST_SKILL not in self._loader.list_skills():
+            return self._sys(f"未安装 skill: {_DIGEST_SKILL}，无法发布日报。")
+        if self._current_skill and self._current_skill != _DIGEST_SKILL:
+            self._maybe_distill(event="skill_switch")
+        self._current_skill = _DIGEST_SKILL
+        self._store.set_meta(self._session_key, current_skill=_DIGEST_SKILL)
+        return self._handle_dialogue(_DIGEST_TASK, publish=True)
 
-        无 skill 声明 contract → 返回空列表（loop.run 行为同旧版）。
-        """
-        out: list = []
-        for name in self._loader.list_skills():
-            contract = self._loader.get_contract(name)
-            if contract is None:
-                continue
-            out.extend(contract.matches_action_triggers(user_text))
-        return out
-
-    def _is_evaluator_triggered_by_any_skill(self, answer: str) -> bool:
-        """遍历所有 skill 的 SkillContract，任一命中 evaluation trigger 即触发。
-
-        无 skill 声明 contract（如全部 skill 都没有 skill.yaml）→ 不触发，安全。
-        遍历是 O(skills × triggers)，当前规模忽略不计；扩展成多 skill 时可加索引。
-        """
-        for name in self._loader.list_skills():
-            contract = self._loader.get_contract(name)
-            if contract is None:
-                continue
-            if contract.is_evaluation_triggered(answer):
-                return True
-        return False
-
-    def _maybe_run_evaluator_retry(self, answer: str, base_history: list[dict]) -> str:
-        """Run optional digest evaluator and one bounded retry path.
-
-        Trigger 来源：
-        skill manifest（skills/<name>/skill.yaml）的 evaluation.triggers 声明，
-        harness 不再持有 skill-specific markers。任一已声明 contract 的 skill
-        命中即触发；未声明 contract 的 skill 永不触发（默认安全）。
-        """
-        if self._evaluator is None:
+    def _maybe_critic_revise(self, answer: str, base_history: list[dict]) -> str:
+        """critic 审 + 至多一轮 revise。**非阻断**：判不合格也照常发布，verdict 只记录、
+        不 gate。critic 是 reflection 的"挑错"半，不是收尾硬闸。"""
+        if self._critic is None or self._critic_max_revise <= 0:
             return answer
-        if not self._is_evaluator_triggered_by_any_skill(answer):
+        verdict = self._critic.review(answer)
+        self._trace_critic(verdict)
+        if verdict.passed or not verdict.critique:
             return answer
-        if self._evaluator_max_retries <= 0:
-            return answer
-
-        attempts = 0
-        current_answer = answer
-        current_messages = list(base_history)
-        while attempts < self._evaluator_max_retries:
-            self._trace_evaluator_event(ts.ACTION_EVALUATOR_CALL_START, attempt=attempts)
-            decision = self._evaluator.evaluate(current_answer, current_messages)
-            self._trace_evaluator_decision(decision, attempts)
-            if not decision.should_retry():
-                return current_answer
-
-            hint = self._build_evaluator_hint(decision)
-            retry_messages = current_messages + [
-                {"role": "assistant", "content": current_answer},
-                {"role": "user", "content": hint},
-            ]
-            self._trace_evaluator_event(
-                ts.ACTION_EVALUATOR_RETRY_TRIGGERED,
-                attempt=attempts,
-                recommended_action=decision.recommended_action,
-                missing=decision.missing,
+        # 一轮 revise（封顶）：注入 NL 批评，主 LLM 修订重出（含末尾机器块）。
+        retry_messages = list(base_history) + [
+            {"role": "assistant", "content": answer},
+            {"role": "user", "content": (
+                f"{verdict.critique}\n\n请据以上质量反馈修订日报后重新输出完整版"
+                f"（含末尾的 adopted_items 机器块）。"
+            )},
+        ]
+        try:
+            return self._loop.run_continuation(
+                messages=retry_messages, tracer=self._loop._tracer, save_on_finish=False,
             )
-            current_answer = self._loop.run_continuation(
-                messages=retry_messages,
-                tracer=self._loop._tracer,
-                save_on_finish=False,
-            )
-            current_messages = retry_messages
-            attempts += 1
+        except Exception as e:
+            _logger.warning(f"critic revise 续跑异常（已 fail-open 用原稿）: {e}")
+            return answer
 
-        final_decision_note = (
-            f"\n\n> 注：本次日报经 evaluator 判定仍有改进空间"
-            f"（missing={decision.missing or '-'}），已达到 evaluator 重试上限。"
-        )
-        return current_answer + final_decision_note
-
-    @staticmethod
-    def _build_evaluator_hint(decision) -> str:
-        """Build the user hint for evaluator retry."""
-        return (
-            f"[evaluator] coverage_ok={decision.coverage_ok}, "
-            f"missing={decision.missing}, "
-            f"soft_issues={decision.soft_issues}, "
-            f"recommended_action={decision.recommended_action}, "
-            f"reason={decision.reason or '-'}。\n"
-            f"请按 recommended_action 调对应 tool 补齐，再重新生成完整日报。"
-        )
-
-    def _trace_evaluator_decision(self, decision, attempt: int) -> None:
-        """Write evaluator decision to trace when available."""
+    def _trace_critic(self, verdict) -> None:
+        """把 critic verdict 记进 trace（仅观测，非阻断）。"""
         tracer = getattr(self._loop, "_tracer", None)
         if tracer is None:
             return
         try:
             tracer.step(
                 action=ts.ACTION_EVALUATOR_CALL_END,
-                attempt=attempt,
-                coverage_ok=decision.coverage_ok,
-                recommended_action=decision.recommended_action,
-                missing=decision.missing,
-                soft_issues=decision.soft_issues,
-                fail_open=decision.fail_open,
-                reason=decision.reason[:120] if decision.reason else "",
+                passed=verdict.passed,
+                critique=(verdict.critique or "")[:200],
             )
         except Exception:
             pass
 
-    def _trace_evaluator_event(self, action: str, **fields) -> None:
-        """Write a generic evaluator trace event."""
-        tracer = getattr(self._loop, "_tracer", None)
-        if tracer is None:
-            return
-        try:
-            tracer.step(action=action, **fields)
-        except Exception:
-            pass
+    def _run_publish_sideeffects(self, answer: str) -> None:
+        """发布副作用：抽机器块条目 → 出处核对（剔除编造）→ 自动写去重历史 → archive。
+        全部 fail-open——已交付的日报不受登记/归档失败影响。"""
+        turn_ctx = getattr(self._loop, "_turn_ctx", None)
+        candidates = list(turn_ctx.candidates) if turn_ctx is not None else []
+        items = extract_adopted_items(answer)
+        kept, dropped = check_provenance(items, candidates)
+        if dropped:
+            _logger.warning(
+                f"[publish] 出处核对剔除 {len(dropped)} 条凭空条目（不在本轮候选里）："
+                + ", ".join(d["fingerprint"] for d in dropped)
+            )
+        written = mark_published_items(kept)
+        _logger.info(f"[publish] 去重历史新写入 {written} 条（本期采用 {len(kept)}）")
+        self._archive_published(answer)
 
-    def _maybe_archive_digest(self, answer: str) -> None:
-        """按 skill manifest archive 段决定是否归档。失败不影响本轮。
+    def _archive_published(self, answer: str) -> None:
+        """发布即落盘 digests/——archive 是 publish 的副作用，不再靠 answer 命中 markers。
 
-        之前 _DIGEST_ARCHIVE_MARKERS 6 元组硬编码在本文件顶部，违反 framework
-        边界。现在遍历 loader.list_skills() 走 contract dispatch。
-
-        触发逻辑：第一个命中 manifest.is_archive_triggered(answer) 的 skill 决定
-        是否落盘 + 落到哪——避免同一 answer 被多 skill 重复归档。
-        路径优先级：manifest.output_dir → self._digests_dir → data_dir("digests")
+        文件名 = 日期 + answer 内容哈希：同一篇日报重复发布（如发布流程重试）落到
+        同名文件、覆盖而非堆叠，保证 archive 幂等（不重复落盘）。内容不同则各自一份。
         """
-        triggered_output_dir: Optional[str] = None
-        triggered_skill: Optional[str] = None
-        for name in self._loader.list_skills():
-            contract = self._loader.get_contract(name)
-            if contract is None:
-                continue
-            if contract.is_archive_triggered(answer):
-                triggered_skill = name
-                triggered_output_dir = contract.archive_output_dir()
-                break
-        if triggered_skill is None:
-            return
-
         now = datetime.now()
-        if triggered_output_dir:
-            target_dir = data_dir(triggered_output_dir)
-        elif self._digests_dir is not None:
-            target_dir = self._digests_dir
-        else:
-            target_dir = data_dir("digests")
-        target_dir.mkdir(parents=True, exist_ok=True)
-        path = target_dir / f"{now.strftime('%Y-%m-%d_%H%M%S')}.md"
-        header = (
-            f"<!-- session_key: {self._session_key} | "
-            f"skill: {self._current_skill or '(auto)'} | "
-            f"archive_skill: {triggered_skill} | "
-            f"archived_at: {now.isoformat(timespec='seconds')} -->\n\n"
-        )
+        target_dir = self._digests_dir if self._digests_dir is not None else data_dir("digests")
         try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            digest_hash = hashlib.sha1(answer.encode("utf-8")).hexdigest()[:8]
+            path = target_dir / f"{now.strftime('%Y-%m-%d')}_{digest_hash}.md"
+            header = (
+                f"<!-- session_key: {self._session_key} | "
+                f"skill: {self._current_skill or '(auto)'} | "
+                f"published_at: {now.isoformat(timespec='seconds')} -->\n\n"
+            )
             path.write_text(header + answer, encoding="utf-8")
         except OSError:
             pass

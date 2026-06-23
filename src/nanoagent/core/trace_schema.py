@@ -37,15 +37,19 @@ ACTION_LLM_CALL_END: Final[str] = "llm_call_end"
 
 
 # ============================================================
-# Tool 调用事件
+# Tool 调用事件（v3 阶段四-4a：span-as-node，start/end 合一为单节点）
 # ============================================================
 
-# emit: MainLoop._run_inner, 每个 tool_call 解析完 args 后（execute 前）
-# fields: iteration(int), tool(str), input(str, raw_args truncated to 200)
+# tool_call_start 已退役（无 emitter，常量保留占位/词表）：一次 tool 调用现在塌成
+# 一个 tool_call_end 操作节点，不再 start+end 两事件靠 (iteration,tool) 配回去。
+# episode_extractor 仍保留 START 分支作向后兼容兜底（读旧 trace），但新 trace 不产 START。
 ACTION_TOOL_CALL_START: Final[str] = "tool_call_start"
 
-# emit: MainLoop._run_inner, tool execute + failure/coverage 判断之后
-# fields: iteration(int), tool(str), input(str), output(str, truncated to 300)
+# emit: MainLoop._emit_tool_op_node, tool execute + augment/breaker/coverage 之后（单节点）
+# fields: iteration(int), tool(str), input(str, raw_args[:200]), output(str[:300]),
+#         status("ok"|"failed"), op_key(str, 细键含 args-hash), klass(str, 失败时),
+#         error_type(str, 粗 substring 分类), is_mutating(bool), duration_ms(int, 真耗时)
+# 注：error_class(5 类)/cause_sig 是冷路径派生（需 episode 上下文），不在本节点。
 ACTION_TOOL_CALL_END: Final[str] = "tool_call_end"
 
 
@@ -90,7 +94,7 @@ ACTION_STOP_CONDITION_MET: Final[str] = "stop_condition_met"
 # emit: MainLoop._maybe_trip_breaker, 某 op_key 连续失败达 klass policy 阈值时
 # fields: iteration(int), tool(str), op_key(str), klass(str), failure_count(int),
 #         threshold(int), is_mutating(bool)
-# 语义：该 op 本轮被禁，后续同 op 调用直接回 [熔断] 消息不执行；turn 继续。
+# 语义：该 op 本轮被禁，后续同 op 调用直接回 [gate-circuit-open] 消息不执行；turn 继续。
 ACTION_CIRCUIT_OPEN: Final[str] = "circuit_open"
 
 
@@ -108,19 +112,22 @@ ACTION_RUN_ERROR: Final[str] = "run_error"
 
 
 # ============================================================
-# Evaluator 事件（Harness 层）
+# Evaluator / Critic 事件（Harness 层）
 # ============================================================
+#
+# 旧 DigestEvaluator（recommended_action 枚举 + 覆盖计数）已退役，发布流程改用
+# Critic 子 agent（NL 批评、非阻断）。CALL_END 被 critic 复用记 verdict；CALL_START /
+# RETRY_TRIGGERED 是旧 evaluator-optimizer 留下的占位常量，当前无 emitter（保留词表）。
 
-# emit: Harness._maybe_run_evaluator_retry, evaluator.evaluate() 调用前
+# 当前无 emitter（旧 evaluator retry 路径已删）
 # fields: attempt(int)
 ACTION_EVALUATOR_CALL_START: Final[str] = "evaluator_call_start"
 
-# emit: Harness._trace_evaluator_decision, evaluator.evaluate() 返回后
-# fields: attempt(int), coverage_ok(bool), recommended_action(str),
-#         missing(list), soft_issues(list), fail_open(bool), reason(str)
+# emit: Harness._trace_critic, Critic.review() 返回后
+# fields: passed(bool), critique(str, 截断 200)
 ACTION_EVALUATOR_CALL_END: Final[str] = "evaluator_call_end"
 
-# emit: Harness._maybe_run_evaluator_retry, 决定触发 run_continuation 前
+# 当前无 emitter（旧 evaluator retry 路径已删）
 # fields: attempt(int), recommended_action(str), missing(list)
 ACTION_EVALUATOR_RETRY_TRIGGERED: Final[str] = "evaluator_retry_triggered"
 
@@ -136,7 +143,7 @@ ACTION_LESSON_USED: Final[str] = "lesson_used"
 # emit: MainLoop._augment_with_failure_memory, FailureMemory 第 2 次同 op 失败
 #       触发 OnlineReflector 且产出 suggestion 时
 # fields: iteration(int), tool(str), diagnosis(str, 截断), has_suggested_args(bool)
-# 语义：在线微反思注入了 [online-reflector] 修复假设（未验证；采纳与否由主 LLM
+# 语义：在线微反思注入了 [learned-fix] 修复假设（未验证；采纳与否由主 LLM
 # 决定，下一次工具调用即环境验证）。复盘 / 小测用此事件量 hint→重试成功率。
 ACTION_REFLECTOR_HINT: Final[str] = "reflector_hint"
 
@@ -145,7 +152,7 @@ ACTION_REFLECTOR_HINT: Final[str] = "reflector_hint"
 # ToolCallRepairGate 事件（schema 校验前置拦截）
 # ============================================================
 
-# emit: MainLoop._run_inner, 检测到 tool_result 以 [tool-call-repair-required] 开头
+# emit: MainLoop._run_inner, 检测到 tool_result 以 [gate-invalid-call] 开头
 # fields: iteration(int), tool(str), skill(str), script(str), validation_error(str)
 # 语义：LLM 生成的 tool call args 在 subprocess 前被 jsonschema 拦截。
 # OutcomeTracker 用此事件判 lesson "ineffective_application" —— 即 lesson
@@ -154,17 +161,20 @@ ACTION_TOOL_CALL_REPAIR_REQUIRED: Final[str] = "tool_call_repair_required"
 
 
 # ============================================================
-# RequiredActionGate
+# RequiredActionGate（v3 阶段三-2b 已退役，常量保留位置/格式）
 # ============================================================
+#
+# RequiredActionGate / ObligationTracker 整条退役（发布流程改成确定性的 publish
+# pipeline，mark 由副作用层自动写、不再靠 obligation 逼 LLM）。两个常量**刻意保留**：
+# eval grader 仍读它们做计数（无 emitter → 恒为 0，不是 bug），且作为可观测信号
+# 词表的占位、别被后续 action 复用冲掉。当前进程内无任何 emit 点。
 
-# emit: MainLoop._run_inner, "LLM 直接答" 分支检测到 ObligationTracker 有未满足项
+# 历史 emit: MainLoop._apply_required_action_gate（已删）
 # fields: iteration(int), obligation_ids(list[str])
-# 语义：必须调用某工具但 LLM 还没调，注入一次 repair message 强制再一轮
 ACTION_OBLIGATION_REPAIR_INJECTED: Final[str] = "obligation_repair_injected"
 
-# emit: MainLoop._run_inner, repair 一次后仍未满足，allow finish 但记 violation
+# 历史 emit: MainLoop._apply_required_action_gate（已删）
 # fields: iteration(int), obligation_ids(list[str])
-# OutcomeTracker / 复盘工具用此事件追踪"声明的 contract 没被遵守"的频率
 ACTION_OBLIGATION_VIOLATION: Final[str] = "obligation_violation"
 
 
