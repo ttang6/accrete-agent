@@ -25,7 +25,7 @@ from nanoagent.evolution.reflexion import ReflexionStore
 from nanoagent.evolution.skill_preference_audit import SkillPreferenceAuditWriter
 from nanoagent.evolution.skill_preference_store import SkillPreferenceStore
 from nanoagent.memory.user_facts import UserFacts
-from nanoagent.runtime.evaluator import DigestEvaluator
+from nanoagent.runtime.critic import Critic
 from nanoagent.runtime.harness import Harness
 from nanoagent.runtime.session import SessionStore
 from nanoagent.runtime.telegram_channel import (
@@ -41,6 +41,7 @@ from nanoagent.skills.loader import SkillLoader
 
 TELEGRAM_BOT_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 TELEGRAM_CHAT_ID_ENV = "TELEGRAM_CHAT_ID"  # 逗号分隔白名单
+TELEGRAM_DIGEST_AT_ENV = "TELEGRAM_DIGEST_AT"  # "HH:MM" 开启进程内每日定时发布；不设则关
 
 
 # ============================================================
@@ -58,7 +59,7 @@ def build_harness_factory(
     store: SessionStore,
     loader: SkillLoader,
     user_facts: UserFacts,
-    evaluator: Optional[DigestEvaluator],
+    critic: Optional[Critic],
     lesson_retriever,
     outcome_tracker,
     lesson_ingestor,
@@ -83,8 +84,8 @@ def build_harness_factory(
             user_facts=user_facts,
             session_key=bootstrap_key,
             base_identity=cli_main.BASE_IDENTITY,
-            evaluator=evaluator,
-            evaluator_max_retries=cli_main.EVALUATOR_MAX_RETRIES,
+            critic=critic,
+            critic_max_revise=cli_main.EVALUATOR_MAX_RETRIES,
             outcome_tracker=outcome_tracker,
             lesson_ingestor=lesson_ingestor,
             promotion_gate=promotion_gate,
@@ -133,17 +134,17 @@ async def run_bot() -> int:
     store = SessionStore(persist_dir=cli_main.SESSION_DIR)
     user_facts = UserFacts(cli_main.USER_FACTS_PATH)
 
-    evaluator: Optional[DigestEvaluator] = None
+    critic: Optional[Critic] = None
     if os.getenv("DASHSCOPE_API_KEY"):
-        eval_llm = LLMClient(
+        critic_llm = LLMClient(
             model=cli_main.EVALUATOR_MODEL,
             provider=cli_main.EVALUATOR_PROVIDER,
-            instance_name="evaluator",
+            instance_name="critic",
             timeout=cli_main.EVALUATOR_TIMEOUT,
         )
-        evaluator = DigestEvaluator(llm=eval_llm)
+        critic = Critic(llm=critic_llm)
         print(
-            f"[Evaluator] enabled: {cli_main.EVALUATOR_PROVIDER}/{cli_main.EVALUATOR_MODEL}"
+            f"[Critic] enabled: {cli_main.EVALUATOR_PROVIDER}/{cli_main.EVALUATOR_MODEL}"
         )
 
     promotion_audit_callback = (
@@ -165,7 +166,7 @@ async def run_bot() -> int:
         store=store,
         loader=loader,
         user_facts=user_facts,
-        evaluator=evaluator,
+        critic=critic,
         lesson_retriever=lesson_retriever,
         outcome_tracker=outcome_tracker,
         lesson_ingestor=lesson_ingestor,
@@ -179,6 +180,7 @@ async def run_bot() -> int:
         token=token,
         allowed_chat_ids=allowed,
         harness_factory=factory,
+        daily_publish_at=os.getenv(TELEGRAM_DIGEST_AT_ENV),
     )
     await channel.start()
     return 0

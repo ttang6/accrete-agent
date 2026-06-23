@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from nanoagent.core.llm_client import LLMClient
+from nanoagent.core.prompt_assets import load_prompt
 from nanoagent.evolution.preference_pipeline.committer import PreferenceCommitter
 from nanoagent.evolution.preference_pipeline.context import DistillContextBuilder
 from nanoagent.evolution.preference_pipeline.pipeline import PreferenceDistillPipeline
@@ -37,7 +38,7 @@ from nanoagent.evolution.runtime_memory.sqlite_backend import (
 from nanoagent.memory.user_facts import UserFacts
 from nanoagent.core.paths import data_dir
 from nanoagent.runtime.context_budget import ContextBudgetConfig
-from nanoagent.runtime.evaluator import DigestEvaluator
+from nanoagent.runtime.critic import Critic
 from nanoagent.runtime.harness import Harness
 from nanoagent.runtime.main_loop import MainLoop
 from nanoagent.runtime.session import SessionStore
@@ -46,9 +47,10 @@ from nanoagent.runtime.tool_output_store import ToolOutputStore
 from nanoagent.skills.contract import aggregate_coverage_specs
 from nanoagent.skills.loader import SkillLoader
 from nanoagent.tool.arxiv import ArxivTool
-from nanoagent.tool.calc import CalcTool
 from nanoagent.tool.describe_script import DescribeScriptTool
 from nanoagent.tool.fetch import FetchTool
+from nanoagent.tool.glob import GlobTool
+from nanoagent.tool.grep import GrepTool
 from nanoagent.tool.load_skill import LoadSkillTool
 from nanoagent.tool.registry import ToolRegistry
 from nanoagent.tool.search import SearchTool
@@ -185,6 +187,10 @@ BASE_IDENTITY: str = """# Role
 - **高信息增益**：拒绝废话，直接呈现核心数据、结论、代码
 - **溯源**：引用工具数据时保留原始来源或链接"""
 
+# md 资产覆盖（prompts/base_identity.md）；文件缺失/正文空 → 回退上面默认。
+# run_bot 经 cli_main.BASE_IDENTITY 读同一份。
+BASE_IDENTITY = load_prompt("base_identity", BASE_IDENTITY)
+
 
 # ============================================================
 # 装配
@@ -209,9 +215,11 @@ def build_registry(skill_loader: SkillLoader) -> ToolRegistry:
     registry.register(DescribeScriptTool(skills_dir=SKILLS_DIR))
     registry.register(LoadSkillTool(skill_loader=skill_loader))
     registry.register(ArxivTool(storage_path=ARXIV_STORAGE_DIR))
-    # CalcTool：V2 strict baseline 验证 probe（详见 src/nanoagent/tool/calc.py 顶部注释）。
-    # 完全静态 schema → 唯一一个开 strict_mode=True 的 BaseTool，跟 SkillExecTool 撞墙形成对照。
-    registry.register(CalcTool())
+    # grep / glob 接替原 CalcTool 当 strict baseline：schema 完全静态 → strict_mode
+    # 默认开着，与 SkillExecTool 的 free-form args（strict 表达不了、保持关）形成对照，
+    # 是"按能力而非厂商决定 strict"的活样本。比 calc 那个纯 probe 多了真实用途。
+    registry.register(GrepTool())
+    registry.register(GlobTool())
     if os.getenv("TAVILY_API_KEY") or os.getenv("EXA_API_KEY"):
         registry.register(SearchTool())
     # SubAgent 委派：一个能联网 search + fetch 的研究子 agent，暴露给主 LLM。
@@ -440,7 +448,7 @@ def repl(harness: Harness) -> int:
         header += f"已存 {n_sessions} 个历史会话（首句消息默认开新会话；用 /resume <key> 续上）。"
     header += (
         "\n命令：/skills | /skill <name> | /profile | "
-        "/sessions | /new (=/clear) | /resume <key> | exit"
+        "/sessions [all|<n>] | /new (=/clear) | /resume <key> | exit"
     )
     print(header)
 
@@ -505,20 +513,21 @@ def main() -> int:
     store = SessionStore(persist_dir=SESSION_DIR)
     user_facts = UserFacts(USER_FACTS_PATH)
 
-    # 副 LLM evaluator：守 DASHSCOPE_API_KEY，缺失 → None。
+    # 副 LLM critic（发布流程质量评审，非阻断）：守 DASHSCOPE_API_KEY，缺失 → None。
+    # EVALUATOR_* 常量沿用为 critic 子 LLM 的配置（model/provider/timeout/封顶轮数）。
     has_dashscope = bool(os.getenv("DASHSCOPE_API_KEY"))
 
-    evaluator = None
+    critic = None
     if has_dashscope:
-        eval_llm = LLMClient(
+        critic_llm = LLMClient(
             model=EVALUATOR_MODEL,
             provider=EVALUATOR_PROVIDER,
-            instance_name="evaluator",
+            instance_name="critic",
             timeout=EVALUATOR_TIMEOUT,
         )
-        evaluator = DigestEvaluator(llm=eval_llm)
-        print(f"[Evaluator] enabled: {EVALUATOR_PROVIDER}/{EVALUATOR_MODEL} "
-              f"(timeout={EVALUATOR_TIMEOUT}s, max_retries={EVALUATOR_MAX_RETRIES})")
+        critic = Critic(llm=critic_llm)
+        print(f"[Critic] enabled: {EVALUATOR_PROVIDER}/{EVALUATOR_MODEL} "
+              f"(timeout={EVALUATOR_TIMEOUT}s, max_revise={EVALUATOR_MAX_RETRIES})")
 
     print_llm_instances()
 
@@ -542,8 +551,8 @@ def main() -> int:
         user_facts=user_facts,
         session_key=CLI_SESSION_KEY,
         base_identity=BASE_IDENTITY,
-        evaluator=evaluator,
-        evaluator_max_retries=EVALUATOR_MAX_RETRIES,
+        critic=critic,
+        critic_max_revise=EVALUATOR_MAX_RETRIES,
         outcome_tracker=outcome_tracker,
         lesson_ingestor=lesson_ingestor,
         promotion_gate=promotion_gate,

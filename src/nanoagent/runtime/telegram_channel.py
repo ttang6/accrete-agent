@@ -48,8 +48,25 @@ _TYPING_INTERVAL = 4
 _SEND_MAX_RETRIES = 3
 _SEND_RETRY_BASE = 0.5
 
+# 定时发布走和 /digest 完全相同的确定性入口（harness 已实现），不另起一套发布逻辑
+_DIGEST_COMMAND = "/digest"
+
 # 同 Harness 的命名约定：channel 前缀 + chat_id + uuid8 三段
 _TG_PREFIX = "tg:"
+
+
+def _parse_hhmm(value: Optional[str]) -> Optional[tuple[int, int]]:
+    """"HH:MM" → (h, m)；None/空 → None（关闭定时）。格式错即 fail-fast。"""
+    if not value:
+        return None
+    try:
+        hh, mm = value.strip().split(":")
+        h, m = int(hh), int(mm)
+    except (ValueError, AttributeError):
+        raise ValueError(f"daily_publish_at 格式应为 HH:MM，收到: {value!r}")
+    if not (0 <= h < 24 and 0 <= m < 60):
+        raise ValueError(f"daily_publish_at 超出范围: {value!r}")
+    return (h, m)
 
 # `(chat_id) -> Harness`：channel 不知道下游装配（loop / store / loader / ...），
 # run_bot.py 注入 closure。lazy 创建：第一条消息时才 build。
@@ -64,6 +81,7 @@ class TelegramChannel:
         token: str,
         allowed_chat_ids: set[str],
         harness_factory: HarnessFactory,
+        daily_publish_at: Optional[str] = None,
     ):
         if not token:
             raise ValueError("TelegramChannel: token 不能为空")
@@ -86,6 +104,13 @@ class TelegramChannel:
         self._handler_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="nanoagent-handler"
         )
+        # 进程内每日定时发布（in-process scheduler）。daily_publish_at="HH:MM" 开启，
+        # None 关闭（向后兼容，不传就没有定时）。设计取舍：计算"下一个 HH:MM 的未来
+        # 时刻"再 sleep —— 天然 at-most-once-per-day，重启不重发，无需额外落盘记录。
+        # 跑在 bot 自己的 event loop 里，复用交互路径同一套 harness / 单 worker 线程池 /
+        # 发送机制（不另起 PTB Application、不靠外部 OS cron）。
+        self._publish_hm = _parse_hhmm(daily_publish_at)
+        self._scheduler_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------
     # 生命周期
@@ -121,6 +146,12 @@ class TelegramChannel:
 
         await self._app.updater.start_polling(allowed_updates=["message"])
         self._running = True
+        if self._publish_hm is not None:
+            self._scheduler_task = asyncio.create_task(self._scheduler_loop())
+            _logger.info(
+                f"[tg] 进程内定时发布已启用 @ "
+                f"{self._publish_hm[0]:02d}:{self._publish_hm[1]:02d}"
+            )
         try:
             while self._running:
                 await asyncio.sleep(1)
@@ -131,6 +162,8 @@ class TelegramChannel:
         self._running = False
 
     async def _shutdown(self) -> None:
+        if self._scheduler_task is not None:
+            self._scheduler_task.cancel()
         for task in list(self._typing_tasks.values()):
             task.cancel()
         self._typing_tasks.clear()
@@ -145,6 +178,50 @@ class TelegramChannel:
         # 关 single-worker executor；wait=True 让在跑的 handle 自然结束，
         # 避免 SqliteBackend 写入半截
         self._handler_executor.shutdown(wait=True)
+
+    # ------------------------------------------------------------
+    # 进程内每日定时发布（in-process scheduler）
+    # ------------------------------------------------------------
+
+    def _seconds_until_next_publish(self) -> float:
+        """距下一个 HH:MM 未来时刻的秒数。已过今天的点 → 算到明天。"""
+        from datetime import datetime, timedelta
+
+        h, m = self._publish_hm
+        now = datetime.now()
+        target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        return (target - now).total_seconds()
+
+    async def _scheduler_loop(self) -> None:
+        """到点对每个白名单 chat 跑 /digest 并推送。计算未来时刻再 sleep —— 天然
+        at-most-once-per-day；发布耗时结束后重算的下一个点必在次日，不会重发。"""
+        while self._running:
+            try:
+                await asyncio.sleep(self._seconds_until_next_publish())
+            except asyncio.CancelledError:
+                return
+            if not self._running:
+                return
+            await self._run_scheduled_publish()
+
+    async def _run_scheduled_publish(self) -> None:
+        """复用交互路径同一套机制：每 chat 的 harness 跑 /digest（单 worker 线程池，
+        与用户消息串行、不跨线程碰 SQLite）→ _send_text 推送。单 chat 失败不影响其余。"""
+        event_loop = asyncio.get_running_loop()
+        for chat_id in sorted(self._allowed):
+            try:
+                harness = self._get_harness(chat_id)
+                response = await event_loop.run_in_executor(
+                    self._handler_executor, harness.handle, _DIGEST_COMMAND
+                )
+                await self._send_text(int(chat_id), response.content or "（空日报）")
+                _logger.info(f"[tg] 定时日报已推送 chat={chat_id}")
+            except Exception as e:  # 单 chat 失败不影响其余
+                _logger.error(
+                    f"[tg] 定时日报失败 chat={chat_id}: {type(e).__name__}: {e}"
+                )
 
     # ------------------------------------------------------------
     # 路由

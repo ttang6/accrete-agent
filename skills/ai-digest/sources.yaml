@@ -107,3 +107,146 @@ sources:
     rss_url: "https://thegradient.pub/rss/"
     category: "Industry News"
     priority: normal
+
+
+# ──────────────────────────────────────────────────────────────
+# X curated users（L0 早期信号）
+#
+# 字段：
+#   username: X 的 handle（不含 @）
+#   category: AI Research / AI Engineering / Open Source / Industry News
+#   priority: high / normal（保留扩展位，当前未使用）
+#
+# fetch_x_curated 会读这个列表。username → user_id 首次 resolve 后写
+# SQLite 缓存，后续调用零额外 API 配额。
+# ──────────────────────────────────────────────────────────────
+
+x_users:
+# ── AI Research / Thought Leaders（研究&思想领袖）────────────────────
+- username: "karpathy"
+  category: "AI Research"
+  priority: high
+  # Andrej Karpathy，前OpenAI/Tesla AI Director，LLM教育与深度洞见顶级来源
+
+- username: "ylecun"
+  category: "AI Research"
+  priority: high
+  # Yann LeCun，Meta Chief AI Scientist，深度学习之父，核心研究与哲学观点第一手
+
+- username: "AndrewYNg"
+  category: "AI Research"
+  priority: high
+  # Andrew Ng，DeepLearning.AI创始人，AI教育与商业应用趋势权威
+
+- username: "demishassabis"
+  category: "AI Research"
+  priority: high
+  # Demis Hassabis，Google DeepMind CEO，AGI与科学AI前沿信号
+
+- username: "ID_AA_Carmack"
+  category: "AI Research"
+  priority: high
+  # John Carmack，前Oculus CTO，硬核工程与AGI实战视角
+
+- username: "gdb"
+  category: "AI Research"
+  priority: high
+  # Greg Brockman，OpenAI联合创始人兼前总裁，技术与产品战略深度信号
+
+- username: "rasbt"
+  category: "AI Research"
+  priority: high
+  # Sebastian Raschka，ML书籍作者与教育者，模型实现与论文解读实用派
+
+# ── Official / Organization（官方&组织号）──────────────────────────
+- username: "OpenAI"
+  category: "Industry News"
+  priority: high
+  # OpenAI官方，产品发布、研究论文、战略公告最及时
+
+- username: "AnthropicAI"
+  category: "Industry News"
+  priority: high
+  # Anthropic官方（Claude团队），安全研究与模型更新核心来源
+
+- username: "GoogleDeepMind"
+  category: "Industry News"
+  priority: high
+  # Google DeepMind官方，前沿研究与科学AI应用第一手
+
+- username: "xai"
+  category: "Industry News"
+  priority: high
+  # xAI官方，Grok模型与新项目动态
+
+- username: "huggingface"
+  category: "Industry News"
+  priority: high
+  # Hugging Face官方，开源模型、数据集、工具生态最全平台
+
+- username: "StabilityAI"
+  category: "Industry News"
+  priority: normal
+  # Stability AI官方，Stable Diffusion系列与生成模型更新
+
+# ── AI Engineering & Product（工程&产品实战）──────────────────────
+- username: "mattshumer_"
+  category: "AI Engineering"
+  priority: high
+  # Matt Shumer，OthersideAI创始人，Agent构建与Prompt工程实战
+
+- username: "OfficialLoganK"
+  category: "AI Engineering"
+  priority: high
+  # Logan Kilpatrick，前OpenAI开发者关系负责人，产品与开发者工具信号
+
+- username: "alliekmiller"
+  category: "Industry News"
+  priority: high
+  # Allie K. Miller，AI商业应用与企业落地顶级顾问
+
+- username: "AIHighlight"
+  category: "AI Engineering"
+  priority: normal
+  # AI工具与Prompt每日速报，高频实用内容
+
+# ── 中文圈 & 其他优质（补充）────────────────────────────────────
+- username: "01AI_Yi"
+  category: "Industry News"
+  priority: high
+  # 零一万物（李开复团队）官方，中文AI产业与模型动态（与kaifulee互补）
+
+- username: "theaifuture"
+  category: "Industry News"
+  priority: normal
+  # AI未来趋势与全球动态汇总，高质量英文+中文视角
+
+- username: "dair_ai"
+  category: "AI Research"
+  priority: high
+  # DAIR.AI，机器学习论文周报与技术线程，研究跟踪极佳
+
+- username: "askalphaxiv"
+  category: "AI Research"
+  priority: normal
+  # alphaXiv，arXiv论文讨论与发现平台，学术前沿过滤器
+
+- username: "chipro"
+  category: "AI Engineering"
+  priority: high
+  # Chip Huyen，AI工程专家，前NVIDIA/Stanford，LLM生产化与MLOps实战
+
+- username: "maximelabonne"
+  category: "AI Engineering"
+  priority: high
+  # Maxime Labonne，Hugging Face/ML工程师，量化、微调与开源模型实战分享
+
+- username: "cameronrwolfe"
+  category: "AI Research"
+  priority: normal
+  # Cameron Wolfe，AI研究员，论文解读与研究趋势总结（实用派）
+
+- username: "DeepSeek_AI"
+  category: "Industry News"
+  priority: high
+  # DeepSeek官方，中国开源强模型（V系列）发布与技术更新

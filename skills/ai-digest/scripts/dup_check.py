@@ -1,24 +1,18 @@
-"""dup_check.py — ai-digest 的历史去重 script。
+"""dup_check.py — ai-digest 的历史去重 script（只剩 check）。
 
-LLM 调用：
+LLM 调用——拉到 candidates 后，过滤已报过的：
 
-  1) 拉到 candidates 后，过滤已报过的：
      skill_exec(skill="ai-digest", script="dup_check", args={
          "action": "check",
          "fingerprints": ["2510.12345", "https://blog.x/post", "owner/repo", ...]
      })
 
-  2) 日报定稿后，把采纳的条目写入历史：
-     skill_exec(skill="ai-digest", script="dup_check", args={
-         "action": "mark",
-         "items": [
-             {"fingerprint": "2510.12345", "source": "fetch_hf", "title": "..."},
-             {"fingerprint": "https://blog.x/post", "source": "fetch_rss", "title": "..."},
-         ]
-     })
+写历史（原 action=mark）已退役：v3 阶段三-2b 把登记下沉到确定性的发布流程
+（`runtime/publish.py` 按日报末尾机器块自动写）。模型只查重、不落库，故本 script
+不再暴露 mark——保留 mark 只会重开"靠 LLM 自觉调工具登记"那条老缝。
 
 存储：`data/memory/digest_reported.jsonl`，全局单例（跨 channel 共享）。
-每行 JSON：{fingerprint, source, title, reported_at}。
+每行 JSON：{fingerprint, source, title, reported_at}（由发布流程写）。
 
 MVP 不做 TTL——个人助手场景 10 年数据也只几 MB，真要加一行筛选即可。
 """
@@ -140,72 +134,6 @@ def _handle_check(args: dict) -> int:
     return 0
 
 
-def _handle_mark(args: dict) -> int:
-    """LLM 传入本次日报采纳的条目列表 → 追加写入 JSONL 历史。
-
-    items 每条要求 `fingerprint`（必填），可选 `source` / `title`。
-    同一 fingerprint 已存在 → 不重复写（保留首次报道记录）。
-    """
-    items = args.get("items") or []
-    if not isinstance(items, list):
-        print_error("items 必须是对象列表")
-        return 1
-
-    valid: list[dict] = []
-    for raw in items:
-        if not isinstance(raw, dict):
-            continue
-        fp = raw.get("fingerprint")
-        if not isinstance(fp, str) or not fp:
-            continue
-        valid.append(
-            {
-                "fingerprint": fp,
-                "source": raw.get("source") or "",
-                "title": raw.get("title") or "",
-            }
-        )
-
-    if not valid:
-        print_error("items 中无合法条目（需至少含 fingerprint 字段）")
-        return 1
-
-    history = _load_history()
-    existing_fps = set(history.keys())
-    now_iso = datetime.now().isoformat(timespec="seconds")
-
-    _HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    written = 0
-    skipped = 0
-    with open(_HISTORY_PATH, "a", encoding="utf-8") as f:
-        for item in valid:
-            fp = item["fingerprint"]
-            if fp in existing_fps:
-                skipped += 1
-                continue
-            record = {
-                "fingerprint": fp,
-                "source": item["source"],
-                "title": item["title"],
-                "reported_at": now_iso,
-            }
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            existing_fps.add(fp)
-            written += 1
-
-    lines = [f"# dedup 记录完成：新增 {written} 条，跳过 {skipped} 条（已存在于历史）"]
-    if written > 0:
-        lines.append("")
-        lines.append("新写入：")
-        for item in valid:
-            if item["fingerprint"] not in history:
-                title = item["title"] or "（无标题）"
-                lines.append(f"- `{item['fingerprint']}` — {title}")
-    print("\n".join(lines))
-    return 0
-
-
 def main() -> int:
     ensure_utf8_stdout()
     args = read_args()
@@ -213,10 +141,15 @@ def main() -> int:
 
     if action == "check":
         return _handle_check(args)
-    if action == "mark":
-        return _handle_mark(args)
 
-    print_error(f"未知 action '{action}'，可选：check / mark")
+    if action == "mark":
+        print_error(
+            "action=mark 已退役：本期采纳条目由发布流程按日报末尾机器块自动登记，"
+            "无需调用 dup_check 写历史。dup_check 只用于选题前 check 去重。"
+        )
+        return 1
+
+    print_error(f"未知 action '{action}'，可选：check")
     return 1
 
 

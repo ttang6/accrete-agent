@@ -31,12 +31,17 @@ RSS 的 `category` 可选值：`AI Research` / `AI Engineering` / `Open Source` 
 HF 的 `sort` 可选值：`hot` / `rising` / `new`。留空使用接口默认。
 GitHub 的 `since` 可选值：`daily` / `weekly` / `monthly`；`language` 留空 = 所有语言。
 
-## 历史去重
+## 历史去重（只用 check）
 
-`dup_check` — 跨批次日报条目去重，避免同一篇论文 / 博客 / 仓库在多次日报中重复出现。
+`dup_check` — 选题前查跨批次重复，避免同一篇论文 / 博客 / 仓库在多次日报中重复出现。
 历史记录存在 `data/memory/digest_reported.jsonl`，跨 channel 共享。
 
-**⚠️ dup_check 与 fetch_* 不同，args 必填**（有两个 action 分派，无合理默认）。**调用前必须先 `describe_script(skill="ai-digest", script="dup_check")` 拿完整 schema**，按返回的结构化示例填 args。
+**dup_check 只有 `check` 一个 action 供你调用**：传 fingerprints 列表查"哪些已报过"。
+**不要自己写历史（不存在 `mark` 工具调用）**——发布流程会在你输出日报后，按末尾机器块
+自动登记本期采纳条目，你只管选题去重，不管落库。
+
+**⚠️ dup_check 与 fetch_* 不同，args 必填**（无合理默认）。**首次调用前先
+`describe_script(skill="ai-digest", script="dup_check")` 拿完整 schema**，按返回的结构化示例填 args。
 
 Fingerprint 规则（三类天然全局唯一，无需前缀）：
 - 论文 → `arxiv_id`（如 `2510.12345`）
@@ -70,6 +75,7 @@ Fingerprint 规则（三类天然全局唯一，无需前缀）：
    - 已报过的条目**默认跳过**，除非有重大新进展值得重报（此时在后续输出里显式说明"延续 X 话题新进展"）
    - **失败降级**：调用失败时跳过本步骤直接进入挑选，日报末尾简短标注即可
 3. **挑选**（只从新鲜条目里挑）：
+   - **覆盖目标（软方法论，不是硬闸）**：尽量三维度都有料——论文 ≥ 3 篇、开源 ≥ 2 条、行业动态 ≥ 1 条。某维度本轮确实拉不到新料（如 RSS 近 48h 无更新）就如实省段，不要为凑数塞旧条目或硬补无关内容。
    - 论文：按 upvotes 降序挑前 3-5 篇（低热度论文跳过）
    - RSS：按分类挑——`AI Research` / `AI Engineering` / `Open Source` / `Industry News` 各 1-2 条，总计 6-8 条
    - GitHub：挑 AI / LLM / agent 相关 2-3 个，去掉明显无关的（如纯前端框架）
@@ -78,13 +84,9 @@ Fingerprint 规则（三类天然全局唯一，无需前缀）：
    - 论文摘要太短或元数据缺失 → `arxiv(action="get_abstract", paper_id=X)` 补完整 abstract / 作者 / 分类
    - 非 arxiv 条目摘要太短（< 100 字）或关键信息缺失 → `fetch` 工具打开 URL 读全文
    - 用户明确要求查某篇论文的相关工作时 → `arxiv(action="citation_graph", paper_id=X)`
-5. **按输出规范写**
-6. **历史去重（mark）**：以下任一信号都触发：
-   - **正常路径**：输出日报后立即调，不等用户确认
-   - **用户显式确认**：用户说"记下来 / 标记 / 保存 / 记一下今天报过的"等表达
-   - 调用：`skill_exec(skill="ai-digest", script="dup_check", args={"action": "mark", "items": [{"fingerprint": ..., "source": ..., "title": ...}, ...]})` 把本次采纳的所有条目（论文 + RSS + GitHub）写入历史
-   - **不要**仅口头说"已记录"而不调工具——harness 已声明 mark obligation，未真调用会被 RequiredActionGate 拦下来
-   - **失败降级**：mark 失败不影响已输出的日报，简短标注即可
+5. **按输出规范写**（散文日报 + 末尾机器块，见下）
+6. **不要自己登记历史**：本期采纳条目由发布流程按你输出的机器块自动写入去重历史，
+   你不调任何 mark 工具、也不口头说"已记录"。
 
 # 输出规范
 
@@ -120,6 +122,27 @@ YYYY-MM-DD · [source_name] · [link](URL)
 ```
 
 某段本轮无新内容时整段省略（不写"无内容"占位）。
+
+## 末尾机器块（必附，发布流程唯一真值）
+
+散文日报给人读；**在日报正文之后，再附一个机器可读的 JSON 块**，列出本期采纳的全部条目。
+发布流程**只读这个机器块**来登记去重历史与做出处核对——散文不参与抽取，也不校验两者一致，**以机器块为准**。漏附机器块 = 本期一条都不会被登记。
+
+格式（放在整个回答的最末尾，用 ```json 围栏）：
+
+```json
+{"adopted_items": [
+  {"fingerprint": "2510.12345", "source": "fetch_hf", "title": "论文英文标题"},
+  {"fingerprint": "https://blog.example/post", "source": "fetch_rss", "title": "文章标题"},
+  {"fingerprint": "owner/repo", "source": "fetch_github", "title": "仓库名"}
+]}
+```
+
+机器块规则：
+- 一条 = 一个采纳条目；`fingerprint` 必填，用 `## 历史去重` 里的三类格式（arxiv_id / 完整 URL / owner/repo）。
+- `source` 填来源工具名（`fetch_hf` / `fetch_rss` / `fetch_github`），`title` 填条目标题。
+- **只列散文里真正写进日报的条目**——fingerprint 必须来自本轮 fetch_* 的真实返回，发布流程会做出处核对，凭空编造的条目会被剔除、不登记。
+- 本轮一条都没采纳（全部已报过 / 三维度皆空）→ 附 `{"adopted_items": []}`。
 
 # 翻译策略
 
