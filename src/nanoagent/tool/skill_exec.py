@@ -76,6 +76,14 @@ class SkillExecTool(BaseTool):
         h = _args_hash(inner if isinstance(inner, dict) else {})
         return f"skill_exec:{skill}/{script}:{h}"
 
+    def lesson_key(self, kwargs: dict) -> str:
+        """lesson 粗键 = skill/script（不含 args-hash）——同一脚本的各种失败归一条 lesson。
+        与 op_key 同前缀、去掉 args-hash 尾巴。"""
+        d = kwargs or {}
+        skill = str(d.get("skill", "") or "?").strip() or "?"
+        script = str(d.get("script", "") or "?").strip() or "?"
+        return f"skill_exec:{skill}/{script}"
+
     @property
     def description(self) -> str:
         return (
@@ -144,9 +152,9 @@ class SkillExecTool(BaseTool):
 
         # ToolCallRepairGate：subprocess 前 jsonschema 校验。
         # fail-open：schema 不存在 → schema 为 None → 跳过校验照常 subprocess。
-        # 校验失败 → 返回 repair_text（以 [tool-call-repair-required] 开头），
+        # 校验失败 → 返回 repair_text（以 [gate-invalid-call] 开头），
         # MainLoop 检测前缀 emit ACTION_TOOL_CALL_REPAIR_REQUIRED trace 事件，
-        # FailureMemory 也把它当 failure 走 lesson 召回 / harness-recovery 链。
+        # FailureMemory 也把它当 failure 走 lesson 召回 / 重复失败保护链。
         schema = load_skill_script_schema(self._skills_dir, skill, script)
         if schema is not None:
             outcome = validate_skill_args(schema, skill, script, args)

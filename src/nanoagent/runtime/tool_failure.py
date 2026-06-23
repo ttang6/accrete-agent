@@ -38,15 +38,18 @@ import hashlib
 import json
 from typing import Any, Final, Tuple
 
+from nanoagent.runtime.context_sources import MARKER_GATE_INVALID_CALL
+
 
 # ============================================================
 # 失败签名常量（SSoT）
 # ============================================================
 
 # tool-output 失败签名：任一前缀命中即视为 failure。
-# `[tool-call-repair-required]` 是 ToolCallRepairGate 的输出标记 ——
-# 也归为 failure，让现有 lesson 召回 + 2nd 次 harness-recovery + 3rd 次
-# stop_condition 保护链对 RepairGate 拦下的协议级错误同样生效。
+# `[gate-invalid-call]`（MARKER_GATE_INVALID_CALL，原 [tool-call-repair-required]）
+# 是 RepairGate 的输出标记 —— 也归为 failure，让现有 lesson 召回 + 重复失败 + 3rd 次
+# stop_condition 保护链对 RepairGate 拦下的协议级错误同样生效。这里 import 同一常量
+# （B∩C 共读单一来源），避免历史上 emit/match 不同步致飞轮断链的 drift。
 # OutcomeTracker 通过独立的 ACTION_TOOL_CALL_REPAIR_REQUIRED trace 事件
 # 把它从 helped/hurt 计数中剥离出来（判 ineffective_application）。
 FAILURE_SIGNATURES: Final[Tuple[str, ...]] = (
@@ -54,7 +57,7 @@ FAILURE_SIGNATURES: Final[Tuple[str, ...]] = (
     "[参数错误]",
     "[执行错误]",
     "[error]",
-    "[tool-call-repair-required]",
+    MARKER_GATE_INVALID_CALL,
     "错误:",
     "退出码",
     "Traceback",

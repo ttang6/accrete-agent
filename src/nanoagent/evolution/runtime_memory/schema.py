@@ -8,11 +8,13 @@
 设计取舍：
 - `@dataclass` 非 frozen（项目约定，参考 `runtime/failure_memory::FailureEntry`）
 - `LessonStatus(str, Enum)` 便于 JSON 序列化
-- `expires_on` 用 ISO date string ("YYYY-MM-DD")，TTL 比较只到天且 mem0
-  metadata filter 对 string 友好；`created_at`/`updated_at` 用完整 ISO datetime
-  保留秒级精度——不一致是有意的
-- `memory_text` vs `recommendation` 双字段：前者给 mem0.add() 用（自然语言长描述），
-  后者给 LessonInjector 用（短句注入 system prompt）
+- `expires_on` 用 ISO date string ("YYYY-MM-DD")，TTL 比较只到天；
+  `created_at`/`updated_at` 用完整 ISO datetime 保留秒级精度——不一致是有意的
+- 内容层 = 必填 `advice`（散文指令，= 旧 recommendation）+ 可选 `example`
+  （结构化示范，= 旧 suggested_action，仅"形状类"修复才有）。`memory_text`
+  （为已废弃 mem0 而生的死字段）已删。
+- `source_type` ∈ {template, reflector, research, human}：来源一等枚举，
+  从"靠 tags/前缀反推"提为显式声明。
 - 不引入 dataclass-json / Pydantic 等依赖，序列化自己写
 """
 
@@ -138,37 +140,48 @@ class RuntimeEpisode:
 class LessonTrigger:
     """Lesson 何时该被检索/注入的条件。
 
-    `error_class` 必填（5 种之一）；`tool_name` / `task_type` Optional——
-    coverage_gap / soft_quality_issue 类不绑工具，task_type 等 router 接入再填。
+    `error_class` 必填（5 种之一）；`tool_name` Optional——coverage_gap /
+    soft_quality_issue 类不绑工具。
     `failure_count_gte` 默认 1；只有 repeated_same_args_failure 模板会设 2。
-    `scope` 用 string 不用 enum，留 "global" / "agent:<name>" / "skill:<name>" 扩展余地。
-    `condition_hint`：一句话适用条件（模板确定性生成），召回注入时随 hint
-    渲染，声明经验边界；旧 payload_json 无此字段时默认空串。
+    `scope` 用 string 不用 enum，是方法论归属的正式键：
+    "global" / "agent:<name>" / "skill:<name>"。
+    `cause_sig`：确定性提取的"这次错在哪"（如 "missing:args"），是 lesson_id
+    第三成分，现以可读字段存储（原只烘进 lesson_id hash、读不回、比不了、调不了
+    粒度）；当前召回不读它做匹配，"按 cause_sig 匹配"留待后续。
+
+    （`task_type` 已删：唯一写入点写 None、零读取；`condition_hint` 已删：
+    100% 派生自 error_class+tool_name+cause_sig，改由 retriever 召回时现渲染。）
     """
 
     error_class: str
-    task_type: Optional[str] = None
     tool_name: Optional[str] = None
     failure_count_gte: int = 1
     scope: str = "global"
-    condition_hint: str = ""
+    cause_sig: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "LessonTrigger":
-        return cls(**data)
+        # 显式取已知字段，容忍并忽略旧 payload 残留的 task_type / condition_hint。
+        return cls(
+            error_class=data["error_class"],
+            tool_name=data.get("tool_name"),
+            failure_count_gte=data.get("failure_count_gte", 1),
+            scope=data.get("scope", "global"),
+            cause_sig=data.get("cause_sig", ""),
+        )
 
 
 @dataclass
 class LessonEvidence:
     """Lesson 的"为什么"——可追溯到具体 trace。
 
-    `repair_example`：本次失败现场 `_skill_arg_validator` 算出的完整结构化
-    修复示例 `{"skill", "script", "args"}`。模板化 recommendation 会把错误信息
-    截到 120 char 丢掉 example_call JSON 块；这里以 dict 完整保留跟着 evidence
-    走。lesson 级聚合后的 canonical 修复示例放 RuntimeLesson.suggested_action。
+    canonical 结构化修复示例已搬进 RuntimeLesson.example（content 层）；这里
+    只留回溯指针 + 实例证据（sample_args_hash / sample_error_message /
+    sample_trace_path），那次具体失败实例仍能靠它们回溯。
+    （`repair_example` 字段已删——结构化示范搬进 content.example。）
     """
 
     source_episode_ids: List[str]
@@ -176,21 +189,18 @@ class LessonEvidence:
     sample_failure_iteration: int
     sample_args_hash: str
     sample_error_message: str  # 截断 300 char
-    repair_example: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "LessonEvidence":
-        # 旧 SQLite payload_json 没有 repair_example 字段；用 .get 兜底默认 None。
         return cls(
             source_episode_ids=list(data.get("source_episode_ids", [])),
             sample_trace_path=data.get("sample_trace_path", ""),
             sample_failure_iteration=data.get("sample_failure_iteration", -1),
             sample_args_hash=data.get("sample_args_hash", ""),
             sample_error_message=data.get("sample_error_message", ""),
-            repair_example=data.get("repair_example"),
         )
 
 
@@ -236,59 +246,58 @@ class RuntimeLesson:
     """
 
     lesson_id: str
-    memory_text: str  # 自然语言长描述，给 mem0.add() 用
-    recommendation: str  # 短句，给 LessonInjector 注入 system prompt
+    advice: str  # 散文指令（= 旧 recommendation），命中后注入失败现场的"该怎么做"
     trigger: LessonTrigger
     evidence: LessonEvidence
     created_at: str  # ISO datetime
     updated_at: str  # ISO datetime
     expires_on: str  # ISO date "YYYY-MM-DD"
+    # 来源一等枚举：template | reflector | research | human。让"置信度该不该带
+    # 来源先验"从哲学之争变可配置项（PromotionGate 未来读它配先验，零 schema 变更）。
+    source_type: str = "template"
     status: LessonStatus = LessonStatus.CANDIDATE
     stats: LessonStats = field(default_factory=LessonStats)
-    ttl_days: int = 14
-    confidence: float = 0.0  # OutcomeTracker 计算 = times_helped / max(1, times_triggered)；PromotionGate 阈值 ~0.6
-    tags: List[str] = field(default_factory=list)
-    # 跨 evidence 聚合后的 canonical 修复示例。
-    # 形如 {"skill", "script", "args"} dict（同 LessonEvidence.repair_example）。
-    # LessonRetriever 在召回时附加 [structured-repair-hint] JSON 块给 LLM——
-    # 区别于 recommendation 短文本：这是结构化"下一步该这么调"的具体方案。
-    # LessonIngestor 决定何时刷新（首次写入 / 之前 None / 显式覆盖）。
-    suggested_action: Optional[Dict[str, Any]] = None
+    # 方法论 lesson 几乎不随时间失效，TTL 退化为安全阀（原 14 → 90）；
+    # 将来按 source_type 配差异（research/环境类短、方法论类长）。
+    ttl_days: int = 90
+    confidence: float = 0.0  # Laplace 平滑 success/max(1,success+failure+1)（见 outcome_tracker）；PromotionGate 阈值 ~0.6
+    # 可选结构化示范（= 旧 suggested_action）。形如 {"skill","script","args"} dict，
+    # 仅"形状类"修复才有；LessonRetriever 召回时附加 [learned-example] 块给 LLM。
+    # 来源 = RepairGate 的 gate_repair_example 直传。example is None 本身即携带
+    # "只有指令/无示范"的区分，无需模式标志位。
+    example: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "lesson_id": self.lesson_id,
-            "memory_text": self.memory_text,
-            "recommendation": self.recommendation,
+            "advice": self.advice,
             "trigger": self.trigger.to_dict(),
             "evidence": self.evidence.to_dict(),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "expires_on": self.expires_on,
+            "source_type": self.source_type,
             "status": self.status.value,
             "stats": self.stats.to_dict(),
             "ttl_days": self.ttl_days,
             "confidence": self.confidence,
-            "tags": list(self.tags),
-            "suggested_action": self.suggested_action,
+            "example": self.example,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RuntimeLesson":
         return cls(
             lesson_id=data["lesson_id"],
-            memory_text=data["memory_text"],
-            recommendation=data["recommendation"],
+            advice=data["advice"],
             trigger=LessonTrigger.from_dict(data["trigger"]),
             evidence=LessonEvidence.from_dict(data["evidence"]),
             created_at=data["created_at"],
             updated_at=data["updated_at"],
             expires_on=data["expires_on"],
+            source_type=data.get("source_type", "template"),
             status=LessonStatus(data.get("status", LessonStatus.CANDIDATE.value)),
             stats=LessonStats.from_dict(data.get("stats", {})),
-            ttl_days=data.get("ttl_days", 14),
+            ttl_days=data.get("ttl_days", 90),
             confidence=data.get("confidence", 0.0),
-            tags=list(data.get("tags", [])),
-            # 旧 SQLite payload_json 没有此字段；.get 兜底 None。
-            suggested_action=data.get("suggested_action"),
+            example=data.get("example"),
         )

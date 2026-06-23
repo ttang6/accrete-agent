@@ -130,7 +130,8 @@ class InMemoryMemoryBackend(MemoryBackend):
         for lesson in self._lessons.values():
             if filters and not _match(lesson, filters):
                 continue
-            if q and q not in lesson.memory_text.lower():
+            # memory_text 已删；query 子串 fallback 改派生在 canonical 的 advice 上
+            if q and q not in (lesson.advice or "").lower():
                 continue
             # 返回拷贝保持隔离
             out.append(RuntimeLesson.from_dict(lesson.to_dict()))
@@ -171,7 +172,7 @@ class InMemoryMemoryBackend(MemoryBackend):
         sample_trace_path: Optional[str] = None,
         sample_failure_iteration: Optional[int] = None,
         sample_error_message: Optional[str] = None,
-        repair_example: Optional[Dict[str, Any]] = None,
+        example: Optional[Dict[str, Any]] = None,
     ) -> RuntimeLesson:
         lesson = self._lessons.get(lesson_id)
         if lesson is None:
@@ -186,12 +187,9 @@ class InMemoryMemoryBackend(MemoryBackend):
             ev.sample_failure_iteration = sample_failure_iteration
         if sample_error_message and not ev.sample_error_message:
             ev.sample_error_message = sample_error_message[:300]
-        # 首次写入 repair_example / suggested_action；不覆盖。
-        if repair_example is not None:
-            if ev.repair_example is None:
-                ev.repair_example = repair_example
-            if lesson.suggested_action is None:
-                lesson.suggested_action = repair_example
+        # 首次写入 content.example（canonical 结构化示范）；不覆盖。
+        if example is not None and lesson.example is None:
+            lesson.example = example
         lesson.updated_at = _now_iso()
         return RuntimeLesson.from_dict(lesson.to_dict())
 

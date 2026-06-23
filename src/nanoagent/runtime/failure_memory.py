@@ -5,9 +5,9 @@
 不含 args_hash（args_hash 降级为 entry 内 debug metadata）。
 `[harness-recovery]` hint 已退役——2nd+ 次失败默认不注入提示文本；保留
 failure_count（供 stop_condition.check_repeated_failure 防循环 loop guard 读）。
-1st 次失败的 lesson 召回（[runtime-lesson]）保留——那是飞轮通道，不是 harness-recovery。
+1st 次失败的 lesson 召回（[learned-lesson]）保留——那是飞轮通道，不是 harness-recovery。
 可选 `online_reflector`（在线微反思）：同意图（recall_key）第 2 次失败且飞轮
-无可召回的 suggested_action 时，副 LLM 基于报错产一个 [online-reflector] 修复
+无可召回的 suggested_action 时，副 LLM 基于报错产一个 [learned-fix] 修复
 假设注入——覆盖"飞轮产不出修复教训"的 hard-tail（默认不装配，开关见 main.py）。
 触发计数特意用意图级而非 op_key（带 args-hash）：换参重试仍失败才最需要外脑。
 
@@ -24,7 +24,7 @@ ReflexionStore 消费出口：
 
 lesson_retriever 注入：
 - 可选传入 `lesson_retriever`——非 None 时，第 1 次失败也查 backend 中的
-  promoted lesson；命中即注入 [runtime-lesson] 提示
+  promoted lesson；命中即注入 [learned-lesson] 提示
 - 不传 / 为 None 时，行为与不注入时完全一致（不影响既有调用方）
 
 Not to be confused with `core/error_classifier.py`——那个分类异常对象，
@@ -150,26 +150,27 @@ class FailureMemory:
 
     def maybe_augment(
         self, tool_name: str, kwargs: dict, raw_args: str, result: str,
-        *, op_key: Optional[str] = None,
+        *, op_key: Optional[str] = None, lesson_key: Optional[str] = None,
     ) -> Tuple[str, Optional[FailureEntry], Optional["RuntimeLesson"]]:
         """观察一次 tool 输出，若是失败则尝试 augment。
 
         Returns: (augmented_result, triggered_entry, used_lesson)
           - 成功调用 → (result, None, None) 不动
-          - 首次失败 + backend 命中 → (augmented_result, None, lesson) [runtime-lesson] 注入
+          - 首次失败 + backend 命中 → (augmented_result, None, lesson) [learned-lesson] 注入
           - 首次失败 + backend 未命中 → (result, None, None) 只记录不 augment
           - 2nd+ 次失败 → (result, entry, None) 累加 failure_count
             （harness-recovery 已退役；entry 非 None 仅供 main_loop 发
             FAILURE_RECOVERY_HINT 重复失败 telemetry trace）；同意图失败 ≥2 次且
-            online_reflector 装配且飞轮无修复时，result 可能附 [online-reflector]
+            online_reflector 装配且飞轮无修复时，result 可能附 [learned-fix]
             假设（见 _maybe_reflect），suggestion 存 pending_reflector_event
             供 main_loop 读后清空
 
         计数键（count_key）：优先用工具自声明的 `op_key`（main_loop 从
         `tool.op_key(kwargs)` 取，是熔断器也会用的同一把键——单一计数源不漂移）；
         op_key 为 None 时退回 `_operation_key` 的默认投影（直接调用 / 单测路径）。
-        lesson 召回键（recall_key）始终走 `_operation_key`，跟 episode_extractor
-        的存储键对齐（与计数粒度有意不同）。
+        lesson 召回键（recall_key）优先用工具自声明的 `lesson_key`（F1 单一携带源，
+        与操作节点 / episode_extractor 存储键同一来源、不再手工对齐）；缺省退回
+        `_operation_key` 的 legacy 投影（与计数粒度有意不同）。
 
         设计取舍：
         - 唯一的 in-turn augment 通道是 1st 次失败的 backend lesson 召回
@@ -179,8 +180,11 @@ class FailureMemory:
         if not _is_tool_failure(result):
             return (result, None, None)
 
-        default_count_key, recall_key = _operation_key(tool_name, kwargs, raw_args)
+        default_count_key, default_recall_key = _operation_key(tool_name, kwargs, raw_args)
         count_key = op_key if op_key is not None else default_count_key
+        # recall_key 优先用工具自声明的 lesson_key（F1 单一携带源，与节点 / episode 存储同键）；
+        # 缺省（直接调用 / 单测 / tool 不在 registry）退回 _operation_key 的 legacy 投影。
+        recall_key = lesson_key if lesson_key is not None else default_recall_key
         args_hash = _canonical_args_hash(raw_args)
         error_type = _classify_tool_failure(result)
         self.intent_failures[recall_key] = self.intent_failures.get(recall_key, 0) + 1
@@ -258,7 +262,7 @@ class FailureMemory:
         lesson = self.lesson_retriever.try_recall(
             tool_key=recall_key, error_type=error_type
         )
-        return lesson is not None and lesson.suggested_action is not None
+        return lesson is not None and lesson.example is not None
 
     # ============================================================
     # 给 ReflexionStore 消费的出口

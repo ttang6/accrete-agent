@@ -17,6 +17,11 @@ from dataclasses import dataclass
 from typing import Final, Optional
 
 from nanoagent.core.logger import get_logger
+from nanoagent.core.prompt_assets import load_prompt
+from nanoagent.runtime.context_sources import (
+    MARKER_LEARNED_FIX,
+    MARKER_LEARNED_HYPOTHESIS,
+)
 
 _logger = get_logger("online_reflector")
 
@@ -98,7 +103,9 @@ class OnlineReflector:
 
     def __init__(self, llm, system_prompt: Optional[str] = None):
         self._llm = llm
-        self._system_prompt = system_prompt or _REFLECTOR_SYSTEM_PROMPT
+        self._system_prompt = system_prompt or load_prompt(
+            "online_reflector", _REFLECTOR_SYSTEM_PROMPT
+        )
 
     def try_suggest(
         self, tool_key: str, raw_args: str, error_output: str
@@ -147,14 +154,14 @@ class OnlineReflector:
         return ReflectorSuggestion(diagnosis=diagnosis, suggested_args=suggested)
 
     def format_hint(self, suggestion: ReflectorSuggestion) -> str:
-        """拼成可附加到 tool_result 末尾的 hint。与 [runtime-lesson] 通道平行：
+        """拼成可附加到 tool_result 末尾的 hint。与 [learned-lesson] 通道平行：
 
-            [online-reflector]（修复假设，未经验证）{diagnosis}
-            [reflector-repair-hypothesis]（建议的完整 args，重试一次即可验证）
+            [learned-fix]（修复假设，未经验证）{diagnosis}
+            [learned-hypothesis]（建议的完整 args，重试一次即可验证）
             {json}
         """
         diagnosis = suggestion.diagnosis[:_HINT_MAX_DIAGNOSIS_CHARS]
-        parts = [f"\n\n[online-reflector]（修复假设，未经验证）{diagnosis}"]
+        parts = [f"\n\n{MARKER_LEARNED_FIX}（修复假设，未经验证）{diagnosis}"]
         if suggestion.suggested_args is not None:
             try:
                 args_json = json.dumps(
@@ -164,7 +171,7 @@ class OnlineReflector:
                 args_json = ""
             if args_json:
                 parts.append(
-                    "\n[reflector-repair-hypothesis]"
+                    f"\n{MARKER_LEARNED_HYPOTHESIS}"
                     "（建议的完整 args，重试一次即可验证）"
                     f"\n{args_json}"
                 )

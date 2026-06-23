@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Optional
 
 from nanoagent.core.logger import get_logger
+from nanoagent.core.prompt_assets import load_prompt
 from nanoagent.evolution.preference_pipeline.context import DistillContextBuilder
 from nanoagent.evolution.preference_pipeline.committer import PreferenceCommitter
 from nanoagent.evolution.preference_pipeline.policy import (
@@ -77,7 +78,7 @@ class PreferenceDistillPipeline:
                 overlap=self._overlap,
             )
             request = SubAgentContextBuilder.build(
-                system_prompt=POLICY_SYSTEM_PROMPT,
+                system_prompt=load_prompt("preference_distiller", POLICY_SYSTEM_PROMPT),
                 blocks=ctx.blocks,
                 allowed_tools=(),
                 output_schema=POLICY_OUTPUT_SCHEMA,

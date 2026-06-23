@@ -141,9 +141,9 @@ class LessonIngestor:
                         sample_trace_path=lesson.evidence.sample_trace_path,
                         sample_failure_iteration=lesson.evidence.sample_failure_iteration,
                         sample_error_message=lesson.evidence.sample_error_message,
-                        # 把 generator 从 fe.extras 抽出的 repair_example
-                        # 透到 backend，让首次写入 lesson.suggested_action。
-                        repair_example=lesson.evidence.repair_example,
+                        # generator 已把 gate 的结构化示范填进 lesson.example；
+                        # 透到 backend 让 extend 首次写入（跨 trace 聚合同一条 lesson）。
+                        example=lesson.example,
                     )
                     extended += 1
                 except Exception as e:

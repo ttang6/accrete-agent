@@ -234,7 +234,8 @@ class SqliteMemoryBackend(MemoryBackend):
             lessons = [l for l in lessons if _match(l, filters)]
         if query:
             q = query.lower()
-            lessons = [l for l in lessons if q in l.memory_text.lower()]
+            # memory_text 已删；query 子串 fallback 改派生在 canonical 的 advice 上
+            lessons = [l for l in lessons if q in (l.advice or "").lower()]
         return lessons[:limit]
 
     def _apply_lesson_metadata(
@@ -285,7 +286,7 @@ class SqliteMemoryBackend(MemoryBackend):
         sample_trace_path: Optional[str] = None,
         sample_failure_iteration: Optional[int] = None,
         sample_error_message: Optional[str] = None,
-        repair_example: Optional[Dict[str, Any]] = None,
+        example: Optional[Dict[str, Any]] = None,
     ) -> RuntimeLesson:
         assert self._conn is not None
         lesson = self.get_lesson(lesson_id)
@@ -304,12 +305,9 @@ class SqliteMemoryBackend(MemoryBackend):
             ev.sample_failure_iteration = sample_failure_iteration
         if sample_error_message and not ev.sample_error_message:
             ev.sample_error_message = sample_error_message[:300]
-        # 首次写入 repair_example / suggested_action；不覆盖。
-        if repair_example is not None:
-            if ev.repair_example is None:
-                ev.repair_example = repair_example
-            if lesson.suggested_action is None:
-                lesson.suggested_action = repair_example
+        # 首次写入 content.example（canonical 结构化示范）；不覆盖。
+        if example is not None and lesson.example is None:
+            lesson.example = example
         lesson.updated_at = _now_iso()
         payload = json.dumps(lesson.to_dict(), ensure_ascii=False)
         self._conn.execute(

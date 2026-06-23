@@ -14,10 +14,10 @@
   - schema 校验通过 → 返回 None
   - schema 校验失败 → 返回 ValidationOutcome（含 repair_text 字符串）
     SkillExecTool 把 repair_text 直接当 tool_result 返回。
-    repair_text 以固定标记 `[tool-call-repair-required]` 开头：
+    repair_text 以固定标记 `[gate-invalid-call]`（MARKER_GATE_INVALID_CALL）开头：
       1. MainLoop 检测前缀 → emit ACTION_TOOL_CALL_REPAIR_REQUIRED trace 事件
-      2. FailureMemory `_FAILURE_SIGNATURES` 含此前缀 → 走 lesson 召回 / 2nd
-         次 harness-recovery / 3rd 次 stop_condition 的现有保护链
+      2. FailureMemory `_FAILURE_SIGNATURES` 含此前缀 → 走 lesson 召回 / 重复失败
+         / 3rd 次 stop_condition 的现有保护链
       3. OutcomeTracker 看到 lesson_used + 同 tool 后续 repair_required
          → 判 ineffective_application（不污染 helped/hurt confidence）
 
@@ -35,9 +35,13 @@ from typing import Any, Optional
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError, best_match
 
+from nanoagent.runtime.context_sources import MARKER_GATE_INVALID_CALL
 
-# 固定前缀，MainLoop / FailureMemory / OutcomeTracker 都靠它识别 repair 输出
-REPAIR_REQUIRED_PREFIX: str = "[tool-call-repair-required]"
+
+# repair 输出固定前缀 = gate 命名空间的 invalid-call marker。字面量单一来源在
+# context_sources（B∩C 共读），此处仅留向后兼容别名（同 tool_failure 的
+# `_FAILURE_SIGNATURES` 别名手法）；MainLoop / FailureMemory / OutcomeTracker 靠它识别。
+REPAIR_REQUIRED_PREFIX: str = MARKER_GATE_INVALID_CALL
 
 
 # ============================================================
@@ -97,11 +101,10 @@ class ValidationOutcome:
     required_fields: list[str]  # 缺失的 required 字段路径（如 "args.action"）
     allowed_values: dict[str, list[Any]]  # enum 字段 → 候选值
     repair_text: str  # 给 LLM 看的多行字符串，已含 prefix
-    # 结构化修复示例（与 repair_text 里的 example_call 块同源）。
-    # 形如 {"skill": ..., "script": ..., "args": {...}}；当 schema 无 examples
-    # 时为 None。让飞轮 trace → episode → lesson.suggested_action 链路保留
-    # 完整 dict 而非只截 120 字符 string；下次召回时 LessonRetriever 可附加
-    # [structured-repair-hint] JSON 块给 LLM。
+    # 结构化修复示例，与 repair_text 里渲染的 repair_example 单行同源；形如
+    # {"skill": ..., "script": ..., "args": {...}}，schema 无 examples 时为 None。
+    # 它沿飞轮 trace → episode → lesson.example 一路携带完整 dict，因此不会被
+    # error_message[:120] 截断；下次召回时 LessonRetriever 据它渲染 [learned-example] 块。
     repair_example: Optional[dict] = None
 
 
@@ -181,12 +184,14 @@ def _format_repair_text(
             + json.dumps(allowed_values, ensure_ascii=False)
         )
     if example_args is not None:
-        lines.append("example_call:")
+        # 单行 canonical JSON，下游 main_loop._apply_repair_gate 与 validation_error /
+        # required_fields 同样按行前缀解析（取代旧的多行 example_call 块 + DOTALL 正则
+        # 往返）。结构化对象单一来源即此处，渲染与解析读同一份 dict。
         lines.append(
-            json.dumps(
+            "repair_example: "
+            + json.dumps(
                 {"skill": skill, "script": script, "args": example_args},
                 ensure_ascii=False,
-                indent=2,
             )
         )
     lines.append(

@@ -148,8 +148,8 @@ class MemoryBackend(ABC):
 
         字段路径用点号支持嵌套：`"trigger.tool_name"` / `"status"`——
         与 RuntimeLesson dataclass attr 路径一一对应（避免双轨）。
-        `query` 当前在 InMemory + SQLite 走 memory_text substring fallback；
-        未来增强（FTS5 / sqlite-vec / mem0 语义检索）由具体 backend 决定。
+        `query` 当前在 InMemory + SQLite 走 advice substring fallback（memory_text
+        已删）；未来增强（FTS5 / sqlite-vec / 语义检索）由具体 backend 决定。
         """
 
     def update_lesson_metadata(
@@ -208,16 +208,15 @@ class MemoryBackend(ABC):
         sample_trace_path: Optional[str] = None,
         sample_failure_iteration: Optional[int] = None,
         sample_error_message: Optional[str] = None,
-        repair_example: Optional[Dict[str, Any]] = None,
+        example: Optional[Dict[str, Any]] = None,
     ) -> RuntimeLesson:
         """累加跨 trace 的 evidence。
 
         - 若 episode_id 不在 evidence.source_episode_ids → 追加（幂等：已有则跳过）
         - 若 sample_* 字段非 None 且当前 lesson 的对应 sample_* 为空/默认 → 写入
           （第一次有 sample 时填，避免后续覆盖原始证据）
-        - 若 repair_example 非 None：若 evidence.repair_example 为 None → 写入；
-          若 lesson.suggested_action 为 None → 同步写入（首次有 canonical 修复
-          示例时填；后续不覆盖，避免被 partial / 错误 schema 污染）
+        - 若 example 非 None 且 lesson.example 为 None → 写入（首次有 canonical
+          结构化示范时填；后续不覆盖，避免被 partial / 错误 schema 污染）
         - 不存在 raise LessonNotFound
 
         典型调用方：caller 先 add_lesson 抓 LessonAlreadyExists 后调本方法。

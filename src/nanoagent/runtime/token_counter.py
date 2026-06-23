@@ -145,14 +145,13 @@ class TokenCounter:
             一致（不算 tools 部分，tools 在 count_messages 里单独算）。
 
         特殊处理 role=='tool'：
-            failure_memory / lesson_retriever 把 [harness-recovery] /
-            [runtime-lesson] hint 追加到 tool message 末尾（见 failure_memory.py:214
-            和 lesson_retriever.py:140），如果直接按 role 归 SOURCE_TOOL_OUTPUT，
-            lesson / recovery 的 token 成本会在 by_source 报告里失踪。
-            split_tool_content_by_hint() 把 tool content 按追加的 hint 标签切成
-            "原 tool 部分 + hint 部分"，分别归到 TOOL_OUTPUT / LESSON / RUNTIME_HINT。
-            +4 framing overhead 留给 SOURCE_TOOL_OUTPUT 段（每条 message 只有一份
-            framing，归到主 source 是合理的）。
+            lesson_retriever / online_reflector 等把 [learned-*] hint 追加到
+            tool message 末尾，如果直接按 role 归 SOURCE_TOOL_OUTPUT，learned /
+            gate / review 的 token 成本会在 by_source 报告里失踪。
+            split_tool_content_by_hint() 按追加 hint 的命名空间前缀把 tool content
+            切成 "原 tool 部分 + hint 部分"，分别归到 TOOL_OUTPUT / learned / gate /
+            review。+4 framing overhead 留给 SOURCE_TOOL_OUTPUT 段（每条 message
+            只有一份 framing，归到主 source 是合理的）。
         """
         result: dict[str, int] = {s: 0 for s in ALL_SOURCES}
         for msg in messages:

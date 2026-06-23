@@ -34,7 +34,6 @@ from nanoagent.evolution.runtime_memory.backend import (
 from nanoagent.evolution.runtime_memory.episode_extractor import EpisodeExtractor
 from nanoagent.evolution.runtime_memory.lesson_generator import (
     _cause_signature,
-    _condition_hint,
     _deterministic_lesson_id,
     _now_iso,
 )
@@ -183,7 +182,7 @@ class ReflectorMintRunner:
                     sample_trace_path=lesson.evidence.sample_trace_path,
                     sample_failure_iteration=lesson.evidence.sample_failure_iteration,
                     sample_error_message=lesson.evidence.sample_error_message,
-                    repair_example=lesson.suggested_action,
+                    example=lesson.example,
                 )
                 report.grounded_extended += 1
             except Exception as e:
@@ -206,7 +205,7 @@ class ReflectorMintRunner:
         trigger = LessonTrigger(
             error_class=error_class, tool_name=fe.tool_key,
             failure_count_gte=1, scope=f"agent:{episode.agent_name}",
-            condition_hint=_condition_hint(fe.tool_key, error_class, cause_sig),
+            cause_sig=cause_sig,
         )
         evidence = LessonEvidence(
             source_episode_ids=[episode.episode_id],
@@ -214,18 +213,20 @@ class ReflectorMintRunner:
             sample_failure_iteration=fe.iteration,
             sample_args_hash=fe.args_hash,
             sample_error_message=fe.error_message[:300],
-            repair_example=result.suggested_action,
         )
+        # 救 diagnosis 进 advice（原寄生在 memory_text 的 [reflector] 前缀里，是
+        # recommendation 没有的真信息）；模板套话丢弃。来源标 source_type=reflector。
+        advice = result.recommendation
+        if result.diagnosis:
+            advice = f"{advice}（根因：{result.diagnosis}）"
         return RuntimeLesson(
             lesson_id=lesson_id,
-            memory_text=f"[reflector] {result.diagnosis}"[:500],
-            recommendation=result.recommendation,
+            advice=advice,
             trigger=trigger, evidence=evidence,
+            source_type="reflector",
             created_at=now, updated_at=now, expires_on=expires_on,
             status=LessonStatus.CANDIDATE, stats=LessonStats(), ttl_days=self._ttl_days,
-            tags=[error_class, episode.agent_name, "reflector"]
-            + ([f"sig:{cause_sig}"] if cause_sig else []),
-            suggested_action=result.suggested_action,
+            example=result.suggested_action,
         )
 
     # ---- 信号缺失半：软 suggest → 物理旁路 jsonl ----

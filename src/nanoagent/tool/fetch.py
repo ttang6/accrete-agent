@@ -187,6 +187,11 @@ class FetchTool(BaseTool):
         url = str((kwargs or {}).get("url", "") or "").strip()
         return f"fetch:{url}" if url else "fetch"
 
+    def lesson_key(self, kwargs: dict) -> str:
+        """lesson 粗键 = 裸 'fetch'：抓取失败的修复经验（换 UA / 换抽取模式等）跨 URL 通用，
+        不按 URL/host 细分。"""
+        return "fetch"
+
     def classify_failure(self, kwargs: dict, output: str, exc=None) -> ToolFailure:
         """从 fetch 自己写的（工具拥有的）错误串映射出 typed klass + retry_after。
 

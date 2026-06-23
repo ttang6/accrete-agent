@@ -44,65 +44,42 @@ from nanoagent.evolution.runtime_memory.schema import (
 # 每个 error_class 对应一组：
 #   tool_name_in_trigger: bool   是否绑工具（coverage/soft 不绑）
 #   failure_count_gte:    int    repeated 类设 2，其他 1
-#   recommendation:       str    短句注入 system prompt（中文）
-#   memory_text:          str    自然语言长描述（英文，给 mem0.add 用）
+#   advice:               str    散文指令短句（= lesson.advice，中文）
+# （memory_text 模板已删——为已废弃 mem0 而生的死字段。）
 _TEMPLATES: Final[Dict[str, Dict[str, Any]]] = {
     "schema_mismatch": {
         "tool_name_in_trigger": True,
         "failure_count_gte": 1,
-        "recommendation": (
+        "advice": (
             "调用 {tool} 前先用 describe_script 确认参数 schema（历史失败特征：{cause}）"
-        ),
-        "memory_text": (
-            "In episode {eid}, tool {tool} rejected args with "
-            "schema_mismatch (signature={cause}): {err}. Re-validate input "
-            "schema (e.g. via describe_script) before next call."
         ),
     },
     "repeated_same_args_failure": {
         "tool_name_in_trigger": True,
         "failure_count_gte": 2,
-        "recommendation": (
+        "advice": (
             "{tool} 同类调用已重复失败 ≥2 次（特征 {cause}），必须改写 args 或换工具路径"
-        ),
-        "memory_text": (
-            "Tool {tool} repeatedly fails (signature={cause}, ≥2 times) in "
-            "episode {eid}: {err}. Rewrite args, switch tool, or call "
-            "describe_script before retrying identical input."
         ),
     },
     "coverage_gap": {
         "tool_name_in_trigger": False,
         "failure_count_gte": 1,
-        "recommendation": (
+        "advice": (
             "输出未覆盖必填字段 {missing}，先补齐再 finalize"
-        ),
-        "memory_text": (
-            "Coverage check failed in episode {eid} at iter {it}: missing "
-            "{missing}. Address coverage gap before finalizing."
         ),
     },
     "soft_quality_issue": {
         "tool_name_in_trigger": False,
         "failure_count_gte": 1,
-        "recommendation": (
+        "advice": (
             "Evaluator 判定低质量（{recommended_action}），按反馈修订：{reason}"
-        ),
-        "memory_text": (
-            "Evaluator returned non-finalize at iter {it} of episode {eid}: "
-            "recommended_action={recommended_action}, missing={missing}, "
-            "soft_issues={soft_issues}, reason={reason}. Revise per critique."
         ),
     },
     "tool_runtime_error": {
         "tool_name_in_trigger": True,
         "failure_count_gte": 1,
-        "recommendation": (
+        "advice": (
             "{tool} 运行时异常（{err_type}），下次调用前考虑兜底/重试策略"
-        ),
-        "memory_text": (
-            "Tool {tool} raised {err_type} in episode {eid}: {err}. Add "
-            "fallback handling or retry-with-backoff."
         ),
     },
     # 通用 semantic_failure 模板：skill script 输出结构化 semantic_failures 列表
@@ -111,15 +88,9 @@ _TEMPLATES: Final[Dict[str, Dict[str, Any]]] = {
     "semantic_failure": {
         "tool_name_in_trigger": True,
         "failure_count_gte": 1,
-        "recommendation": (
+        "advice": (
             "{tool} 报告了 {sf_count} 条 semantic failure（首条 {sf_primary_type}）："
             "{sf_primary_message}。按 failure_type 修复后重调；勿直接 finalize"
-        ),
-        "memory_text": (
-            "Tool {tool} reported {sf_count} semantic_failures in episode {eid} "
-            "(first type={sf_primary_type}): {sf_primary_message}. Address each "
-            "failure_type before next call; the script's output JSON contains the "
-            "full list."
         ),
     },
 }
@@ -154,16 +125,14 @@ class LessonGenerator:
             tool_name=tool_for_trigger,
             failure_count_gte=tpl["failure_count_gte"],
             scope=f"agent:{episode.agent_name}",
-            task_type=None,  # 暂置 None；router 接入后再填
-            condition_hint=_condition_hint(tool_for_trigger, error_class, cause_sig),
+            cause_sig=cause_sig,  # 确定性提取，存为可读字段（原只烘进 lesson_id hash）
         )
 
-        # 结构化 repair_example 从 extras 流入 evidence + 同时
-        # 作为 lesson 首次 suggested_action（首条 evidence 即 canonical）；
-        # extend_lesson_evidence 后续 ingest 时 LessonIngestor 决定是否更新。
-        repair_example = (fe.extras or {}).get("repair_example")
-        if not isinstance(repair_example, dict):
-            repair_example = None
+        # 结构化 example 从 extras 流入 content.example（首条 evidence 即 canonical）；
+        # 来源 = RepairGate 的 gate_repair_example（extras["repair_example"] 是其 plumbing 键）。
+        example = (fe.extras or {}).get("repair_example")
+        if not isinstance(example, dict):
+            example = None
 
         evidence = LessonEvidence(
             source_episode_ids=[episode.episode_id],
@@ -171,13 +140,11 @@ class LessonGenerator:
             sample_failure_iteration=fe.iteration,
             sample_args_hash=fe.args_hash,
             sample_error_message=fe.error_message[:300],
-            repair_example=repair_example,
         )
 
         fmt_ctx = _build_format_context(episode, fe)
         fmt_ctx["cause"] = cause_sig or "-"
-        recommendation = _safe_format(tpl["recommendation"], fmt_ctx)
-        memory_text = _safe_format(tpl["memory_text"], fmt_ctx)
+        advice = _safe_format(tpl["advice"], fmt_ctx)
 
         now = _now_iso()
         expires_on = (
@@ -190,24 +157,19 @@ class LessonGenerator:
             cause_sig=cause_sig,
         )
 
-        tags = [error_class, episode.agent_name]
-        if cause_sig:
-            tags.append(f"sig:{cause_sig}")
-
         return RuntimeLesson(
             lesson_id=lesson_id,
-            memory_text=memory_text,
-            recommendation=recommendation,
+            advice=advice,
             trigger=trigger,
             evidence=evidence,
+            source_type="template",
             stats=LessonStats(),
             status=LessonStatus.CANDIDATE,
             created_at=now,
             updated_at=now,
             expires_on=expires_on,
             ttl_days=self._ttl_days,
-            tags=tags,
-            suggested_action=repair_example,
+            example=example,
         )
 
 

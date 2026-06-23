@@ -27,11 +27,16 @@ from typing import Dict, List, Optional, Tuple
 
 from nanoagent.core.logger import get_logger
 from nanoagent.evolution.runtime_memory.backend import MemoryBackend
+from nanoagent.evolution.runtime_memory.lesson_generator import _condition_hint
 from nanoagent.evolution.runtime_memory.schema import LessonStatus, RuntimeLesson
+from nanoagent.runtime.context_sources import (
+    MARKER_LEARNED_EXAMPLE,
+    MARKER_LEARNED_LESSON,
+)
 
 _logger = get_logger("lesson_retriever")
 
-# 单条 [runtime-lesson] 块的 recommendation 上限。超过会硬截断 + "..."
+# 单条 [learned-lesson] 块的 recommendation 上限。超过会硬截断 + "..."
 # 防止 lesson 绕过 main_loop 的 max_tool_output_chars 截断膨胀 context。
 _HINT_MAX_RECOMMENDATION_CHARS = 300
 
@@ -132,42 +137,45 @@ class LessonRetriever:
     def format_hint(self, lesson: RuntimeLesson) -> str:
         """把 lesson 拼成可附加到 tool_result 末尾的 hint 字符串。
 
-        格式与现有 [harness-recovery] 通道平行：
-            [runtime-lesson] {recommendation} (lesson_id=xxx, conf=0.75)
-            [适用条件] {trigger.condition_hint}     ← 可选（非空时）
-            [structured-repair-hint]（示例标注） {json}     ← 可选
+        格式：
+            [learned-lesson] {advice} (lesson_id=xxx, conf=0.75)
+            [适用条件] {现渲染：适用于 X 的 Y 类失败（特征 Z）}     ← 基本恒有
+            [learned-example]（示例标注） {json}     ← 可选
 
-        recommendation 硬截断到 `_HINT_MAX_RECOMMENDATION_CHARS`（300 char），
-        防止超长 lesson 绕过 MainLoop 的 max_tool_output_chars 把 context 撑爆。
-        MainLoop 在 augment 之前已对 raw tool_result 截断；这里负责把追加部分
-        也限制在受控范围内。
+        advice 硬截断到 `_HINT_MAX_RECOMMENDATION_CHARS`（300 char），防止超长
+        lesson 绕过 MainLoop 的 max_tool_output_chars 把 context 撑爆。
 
-        lesson.suggested_action 非 None 时附加结构化修复块。示例来自历史失败
-        现场，参数值是当时任务的——标注语提醒 LLM 结构照用、值按当前任务替换
-        （防照抄旧实例值帮倒忙）。
-        只在失败现场召回时注入（FailureMemory.maybe_augment 路径），不进
+        [适用条件] 行从 trigger 的 error_class+tool_name+cause_sig **现渲染**
+        （condition_hint 字段已删——它 100% 派生自这三个输入，不再存储）。
+
+        lesson.example 非 None 时附加结构化修复块。示例来自历史失败现场，参数值
+        是当时任务的——标注语提醒 LLM 结构照用、值按当前任务替换（防照抄旧实例值
+        帮倒忙）。只在失败现场召回时注入（FailureMemory.maybe_augment 路径），不进
         常驻 system prompt——避免长 JSON 污染 prompt cache。
         """
-        rec = lesson.recommendation or ""
+        rec = lesson.advice or ""
         if len(rec) > _HINT_MAX_RECOMMENDATION_CHARS:
             rec = rec[:_HINT_MAX_RECOMMENDATION_CHARS] + "...(截断)"
         parts = [
-            f"\n\n[runtime-lesson] {rec} "
+            f"\n\n{MARKER_LEARNED_LESSON} {rec} "
             f"(lesson_id={lesson.lesson_id}, conf={lesson.confidence:.2f})"
         ]
-        condition = (lesson.trigger.condition_hint or "").strip()
+        condition = _condition_hint(
+            lesson.trigger.tool_name, lesson.trigger.error_class,
+            lesson.trigger.cause_sig,
+        ).strip()
         if condition:
             parts.append(f"\n[适用条件] {condition[:200]}")
-        if lesson.suggested_action is not None:
+        if lesson.example is not None:
             try:
                 action_json = json.dumps(
-                    lesson.suggested_action, ensure_ascii=False, indent=2
+                    lesson.example, ensure_ascii=False, indent=2
                 )
             except (TypeError, ValueError):
                 action_json = ""
             if action_json:
                 parts.append(
-                    "\n[structured-repair-hint]"
+                    f"\n{MARKER_LEARNED_EXAMPLE}"
                     "（历史同类失败的修复示例：结构照用，具体参数值按当前任务替换）"
                     f"\n{action_json}"
                 )

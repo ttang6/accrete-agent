@@ -50,12 +50,13 @@ def _lesson_to_summary_dict(lesson: RuntimeLesson) -> dict:
         "evidence_episode_count": len(lesson.evidence.source_episode_ids),
         "expires_on": lesson.expires_on,
         "updated_at": lesson.updated_at,
-        "recommendation": lesson.recommendation,
+        "source_type": lesson.source_type,
+        "advice": lesson.advice,
     }
 
 
 def _print_human_row(lesson: RuntimeLesson) -> None:
-    rec = lesson.recommendation or ""
+    rec = lesson.advice or ""
     if len(rec) > 80:
         rec = rec[:77] + "..."
     tool = lesson.trigger.tool_name or "(none)"

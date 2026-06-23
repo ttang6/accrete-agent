@@ -135,7 +135,13 @@ class EpisodeExtractor:
             if action == ACTION_TOOL_CALL_END:
                 seq += 1
                 output = ev.get("output", "") or ""
-                if _is_tool_failure(output):
+                # 学习路径成败优先读节点结构化 status（v3 阶段四-4c，main_loop 已写）；
+                # 旧 trace 无 status 字段时回退 _is_tool_failure 子串判定。子串判定降为
+                # "热路径闸 + 读旧 trace 兜底"，不再是学习路径的事实源。
+                status = ev.get("status")
+                failed = (status == "failed") if status in ("ok", "failed") \
+                    else _is_tool_failure(output)
+                if failed:
                     fe = _build_tool_failure(
                         ev, last_call_by_iter, repair_event_by_iter
                     )
@@ -267,9 +273,12 @@ def _build_tool_failure(
         if start_ev:
             raw_args = start_ev.get("input", "") or ""
     output = end_ev.get("output", "") or ""
+    # F1：tool_key 优先读节点携带的 lesson_key（main_loop._emit_tool_op_node 写，
+    # 与热路径召回键同一来源）；旧 trace 无此字段时回退 _build_tool_key（legacy 投影）。
+    tool_key = end_ev.get("lesson_key") or _build_tool_key(tool, raw_args)
     extras: Dict[str, Any] = {"raw_input": raw_args[:200]}
-    # 结构化 repair_example / required_fields 经 extras 流到 LessonGenerator →
-    # LessonEvidence.repair_example + RuntimeLesson.suggested_action / cause_sig
+    # 结构化 repair_example / required_fields 经 extras 流到 LessonGenerator，
+    # 在那里落进 RuntimeLesson.example（content 层）+ cause_sig
     if repair_event_by_iter is not None:
         repair_ev = repair_event_by_iter.get((iteration, tool))
         if isinstance(repair_ev, dict):
@@ -288,7 +297,7 @@ def _build_tool_failure(
         extras["semantic_failures"] = sf
     return FailureEvent(
         iteration=iteration,
-        tool_key=_build_tool_key(tool, raw_args),
+        tool_key=tool_key,
         args_hash=_canonical_args_hash(raw_args),
         error_type=_classify_tool_error(output),
         error_message=output[:300],
