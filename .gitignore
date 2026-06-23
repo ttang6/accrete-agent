@@ -38,3 +38,7 @@ evals/reports/
 # OS
 .DS_Store
 Thumbs.db
+
+# prompts/ 只公开示例；真实提示词留本地、暂不跟踪
+prompts/*
+!prompts/base_identity_example.md

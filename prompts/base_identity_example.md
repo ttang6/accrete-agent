@@ -1,8 +1,8 @@
 ---
-# Example prompt asset. Edit the body below to override the agent's base
-# identity (takes effect after a restart). Leave the body empty to fall back
-# to the in-code default. This file ships only as a placeholder — replace it
-# with your own prompt.
+# Example prompt asset. Copy this file to prompts/base_identity.md and edit the
+# body to override the agent's base identity (takes effect after a restart).
+# As-is, this file is only a sample and is not loaded; with an empty body the
+# agent falls back to the in-code default.
 ---
 
 # Role
