@@ -39,12 +39,17 @@ class ToolFailure:
 
 
 class BaseTool(ABC):
-    # 每个 tool 自主声明是否启用 OpenAI strict mode。
-    # strict 模式下 OpenAI 用约束解码强制 LLM 输出符合 schema（不再"软提示"），
-    # 但要求 schema 满足额外约束：所有 properties 都进 required（可选用
-    # ["type","null"] 联合）+ 每个 object 加 additionalProperties:false +
-    # 不支持 minLength/pattern/format/etc。
-    # 默认 False；只有 schema 已 strict-compliant 的子类（如 SkillExecTool）覆盖为 True。
+    # 每个 tool 自主声明是否启用 OpenAI strict mode。strict 下 provider 用约束解码
+    # 强制 LLM 输出符合 schema（不再"软提示"），但要求 schema 满足额外约束：所有
+    # properties 进 required（可选字段用 ["type","null"] 联合）+ 每个 object 加
+    # additionalProperties:false + 不支持 minLength/pattern/format。
+    #
+    # 取舍按"这条约束 strict 能不能表达"分流，不按 provider 身份：schema 完全静态的
+    # 工具（grep / glob）默认就把 strict_mode 开着，让 provider 兜住结构合规；
+    # SkillExecTool 的 args 是 free-form object，strict 表达不了，保持 False、靠
+    # 自己的 arg validator 每次校验。class 默认留 False 是因为多数现有工具 schema
+    # 还没做到 strict-compliant（缺 additionalProperties:false / 有可选字段），贸然
+    # 全局翻 True 会被 provider 当场拒——所以是各工具按能力 opt-in，而非全局默认。
     strict_mode: bool = False
 
     # SubAgent 递归 guard 标记：SubAgentTool 覆盖为 True。SubAgentRunner 裁剪
@@ -63,6 +68,19 @@ class BaseTool(ABC):
         不由框架按 tool_name 猜粒度。kwargs 是本次调用解析后的参数 dict。
         """
         return f"{self.name}:{_args_hash(kwargs or {})}"
+
+    def lesson_key(self, kwargs: dict) -> str:
+        """跨 trace lesson 存储 / 召回的**粗键**（意图级，不含 args-hash）——工具自声明。
+
+        F1 单一携带源（v3 阶段四-4b）：emit 时写进操作节点，热路径召回
+        （FailureMemory）与冷路径 episode 存储（EpisodeExtractor）都读这把携带键，
+        不再 `_operation_key.recall_key` / `episode_extractor._build_tool_key` 两处各算
+        一遍靠手工对齐（历史 drift 风险点）。默认 = tool_name；子类覆盖给更合适的粒度。
+
+        与 op_key 分工：op_key 细（含 args-hash，服务熔断/计数，一组 args 一个 op）；
+        lesson_key 粗（一类操作一条 lesson）。**绝不拿 op_key 当 lesson 键**（太细配不上）。
+        """
+        return self.name
 
     def classify_failure(
         self, kwargs: dict, output: str, exc: Optional[BaseException] = None

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from typing import Callable, Optional
 
 from nanoagent.tool.base import BaseTool, FunctionTool
@@ -17,6 +18,10 @@ class ToolRegistry:
         if tool.name in self._tools:
             _logger.warning(f"工具 '{tool.name}' 已存在，将被覆盖")
         self._tools[tool.name] = tool
+
+    def unregister(self, name: str) -> bool:
+        """移除一个已注册工具；不存在返回 False。eval 收紧工具面（堵 route-around）用。"""
+        return self._tools.pop(name, None) is not None
 
     def get(self, name: str) -> Optional[BaseTool]:
         """根据名称获取工具"""
@@ -70,15 +75,23 @@ class ToolRegistry:
     # ---------- 并发执行（从 async_tool_executor 整合） ----------
 
     async def _execute_one(self, name: str, **kwargs) -> dict:
-        """异步执行单个工具，捕获异常不影响其他工具。"""
+        """异步执行单个工具，捕获异常不影响其他工具。
+
+        `duration_ms` 是本次调用的 perf_counter 真耗时——并发路径下每个 task 各自
+        计时（区别于 trace 的"距上一事件间隔"），供操作节点写真耗时。
+        """
         loop = asyncio.get_running_loop()
+        t0 = time.perf_counter()
         try:
             result = await loop.run_in_executor(
                 None, lambda: self.execute(name, **kwargs)
             )
-            return {"tool": name, "status": "success", "result": result}
+            status = "success"
         except Exception as e:
-            return {"tool": name, "status": "error", "result": f"[执行错误] {name}: {e}"}
+            result = f"[执行错误] {name}: {e}"
+            status = "error"
+        dur = round((time.perf_counter() - t0) * 1000)
+        return {"tool": name, "status": status, "result": result, "duration_ms": dur}
 
     async def _execute_parallel_async(self, calls: list[dict]) -> list[dict]:
         """并发执行多个工具调用。
