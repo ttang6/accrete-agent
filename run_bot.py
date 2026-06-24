@@ -21,9 +21,6 @@ from dotenv import load_dotenv
 
 import main as cli_main
 from nanoagent.core.llm_client import LLMClient
-from nanoagent.evolution.reflexion import ReflexionStore
-from nanoagent.evolution.skill_preference_audit import SkillPreferenceAuditWriter
-from nanoagent.evolution.skill_preference_store import SkillPreferenceStore
 from nanoagent.memory.user_facts import UserFacts
 from nanoagent.runtime.critic import Critic
 from nanoagent.runtime.harness import Harness
@@ -65,8 +62,8 @@ def build_harness_factory(
     lesson_ingestor,
     promotion_gate,
     promotion_audit_callback=None,
-    distill_pipeline=None,
-    preference_store=None,
+    global_memory=None,
+    global_memory_distiller=None,
 ):
     """返回 (chat_id) -> Harness 的 closure。
 
@@ -91,9 +88,11 @@ def build_harness_factory(
             promotion_gate=promotion_gate,
             promotion_audit_callback=promotion_audit_callback,
             session_key_prefix=prefix,
-            reflexions_store=loader.reflexions_store,
-            distill_pipeline=distill_pipeline,
-            preference_store=preference_store,
+            global_memory=global_memory,
+            global_memory_distiller=global_memory_distiller,
+            context_window_tokens=cli_main.CONTEXT_MAX_TOKENS,
+            auto_distill_overflow_ratio=cli_main.AUTO_DISTILL_OVERFLOW_RATIO,
+            auto_distill_switch_ratio=cli_main.AUTO_DISTILL_SWITCH_RATIO,
         )
     return factory
 
@@ -118,14 +117,7 @@ async def run_bot() -> int:
         return 1
 
     # 共享下游服务（一次装配，多 chat 共用）
-    reflexions = ReflexionStore(cli_main.REFLEXIONS_DIR)
-    preference_store = SkillPreferenceStore(cli_main.SKILL_PREFERENCES_PATH)
-    preference_audit = SkillPreferenceAuditWriter(cli_main.SKILL_PREFERENCES_AUDIT_PATH)
-    loader = SkillLoader(
-        cli_main.SKILLS_DIR,
-        reflexions_store=reflexions,
-        preference_store=preference_store,
-    )
+    loader = SkillLoader(cli_main.SKILLS_DIR)
     # Telegram channel 在单 worker ThreadPoolExecutor 跑 handle，但装配仍在
     # main thread；sqlite check_same_thread=False 让 connection 跨"装配 thread →
     # 单 worker thread"使用。多 worker 并发写不安全，靠 channel 单 worker 串行护住。
@@ -133,6 +125,14 @@ async def run_bot() -> int:
         cli_main.build_runtime_memory(sqlite_check_same_thread=False)
     store = SessionStore(persist_dir=cli_main.SESSION_DIR)
     user_facts = UserFacts(cli_main.USER_FACTS_PATH)
+    # 全局自动记忆（Dream-lite）：多 chat 共用一份（同 user_facts 的单用户假设）。
+    global_memory = cli_main.GlobalMemory(cli_main.AUTO_MEMORY_PATH)
+    global_memory_distiller = (
+        cli_main.GlobalMemoryDistiller(
+            global_memory, cli_main.SubAgentRunner(llm_builder=cli_main.build_subagent_llm)
+        )
+        if os.getenv("DASHSCOPE_API_KEY") else None
+    )
 
     critic: Optional[Critic] = None
     if os.getenv("DASHSCOPE_API_KEY"):
@@ -153,15 +153,6 @@ async def run_bot() -> int:
         else None
     )
 
-    distill_pipeline = cli_main.build_distill_pipeline(
-        preference_store, preference_audit
-    )
-    if distill_pipeline is not None:
-        print(
-            f"[DistillPipeline] enabled: {cli_main.DISTILLER_PROVIDER}/"
-            f"{cli_main.DISTILLER_MODEL}"
-        )
-
     factory = build_harness_factory(
         store=store,
         loader=loader,
@@ -172,8 +163,8 @@ async def run_bot() -> int:
         lesson_ingestor=lesson_ingestor,
         promotion_gate=promotion_gate,
         promotion_audit_callback=promotion_audit_callback,
-        distill_pipeline=distill_pipeline,
-        preference_store=preference_store,
+        global_memory=global_memory,
+        global_memory_distiller=global_memory_distiller,
     )
 
     channel = TelegramChannel(

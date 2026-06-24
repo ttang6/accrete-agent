@@ -1,7 +1,7 @@
 """nanoagent v2 CLI 入口 — channel 薄壳。
 
 装配：LLMClient + ToolRegistry + MainLoop + SessionStore + SkillLoader + UserFacts
-      + ReflexionStore + Harness（channel-agnostic orchestrator）
+      + Harness（channel-agnostic orchestrator）
 
 两种运行模式由顶部常量 `TASK` / `TASK_FILE` 切换：
 - 两者非空 → one-shot 模式（stateless，不过 Harness / Session / UserFacts）
@@ -17,14 +17,9 @@ from typing import Optional
 
 from nanoagent.core.llm_client import LLMClient
 from nanoagent.core.prompt_assets import load_prompt
-from nanoagent.evolution.preference_pipeline.committer import PreferenceCommitter
-from nanoagent.evolution.preference_pipeline.context import DistillContextBuilder
-from nanoagent.evolution.preference_pipeline.pipeline import PreferenceDistillPipeline
-from nanoagent.evolution.preference_pipeline.scheduler import DistillScheduler
 from nanoagent.runtime.subagent import SubAgentRunner, build_subagent_llm
-from nanoagent.evolution.reflexion import ReflexionStore
-from nanoagent.evolution.skill_preference_audit import SkillPreferenceAuditWriter
-from nanoagent.evolution.skill_preference_store import SkillPreferenceStore
+from nanoagent.memory.global_memory import GlobalMemory
+from nanoagent.memory.global_memory_distiller import GlobalMemoryDistiller
 from nanoagent.evolution.runtime_memory.lesson_ingestor import LessonIngestor
 from nanoagent.evolution.runtime_memory.lesson_retriever import LessonRetriever
 from nanoagent.evolution.runtime_memory.online_reflector import OnlineReflector
@@ -92,20 +87,7 @@ CLI_SESSION_KEY: str = "cli:default"
 SESSION_DIR: Path = Path("data/runtime/sessions")
 SKILLS_DIR: Path = Path("skills")
 USER_FACTS_PATH: Path = Path("data/memory/user_facts.json")
-REFLEXIONS_DIR: Path = Path("data/reflexions")
-SKILL_PREFERENCES_PATH: Path = Path("data/memory/skill_preferences.json")
-SKILL_PREFERENCES_AUDIT_PATH: Path = Path("data/memory/skill_preferences_audit.jsonl")
-
-# 偏好蒸馏 pipeline：副 LLM (qwen-flash via dashscope) 在 turn_end / skill_switch /
-# session_end 触发，沉淀 NL preference summary。DASHSCOPE_API_KEY 缺失 → pipeline=None
-# → Harness hook 静默跳过，向后兼容。
-DISTILLER_MODEL: str = "qwen-flash"
-DISTILLER_PROVIDER: str = "dashscope"
-DISTILL_FLOOR: int = 3                # 自上次蒸馏新增 user 轮次下限
-DISTILL_CADENCE_TURNS_N: int = 30     # cadence 轮次阈值
-DISTILL_CADENCE_MINUTES_T: int = 30   # cadence 时间阈值（分钟）
-DISTILL_OVERLAP: int = 3              # 窗口回看重叠条数
-SUBAGENT_MAX_ITERATIONS: int = 1      # 零工具 policy sub-agent 上限
+AUTO_MEMORY_PATH: Path = Path("data/memory/auto_memory.md")  # 全局自动记忆（Dream-lite）
 
 # SubAgent 研究子 agent（联网 search + fetch，结论隔离回主对话）
 SUBAGENT_RESEARCH_MAX_ITER: int = 6
@@ -131,8 +113,6 @@ ENABLE_ONLINE_REFLECTOR: bool = _env_bool("NANOAGENT_ONLINE_REFLECTOR", False)  
 # 滑窗失败率总闸（Track A-b.4）。默认开（生产兜底）。Track E eval 关掉：实测它在 R2
 # 上抢在熔断器降级完成前掐断、抹平熔断收益（详见 main_loop 注释）。
 ENABLE_FAILURE_RATE_GATE: bool = _env_bool("NANOAGENT_ENABLE_FAILURE_RATE_GATE", True)
-# PreferenceDistiller-Lite 装配开关。DASHSCOPE_API_KEY 缺失也会自然降级为 None。
-ENABLE_PREFERENCE_DISTILLER: bool = _env_bool("NANOAGENT_ENABLE_PREFERENCE_DISTILLER", True)
 
 # Phase E-v1：PromotionGate 自动 candidate ↔ promoted ↔ retired 决策。
 # 阈值都是 v1 拍脑袋（advisor 反对的那个但温和），靠 P2 INEFFECTIVE 自动降级机制
@@ -153,6 +133,10 @@ PROMOTION_AUDIT_LOG_PATH: Path = Path("data/runtime/lessons/promotion_audit.json
 # P4-lite D-context：Context Hygiene Foundation 默认开启
 ENABLE_CONTEXT_HYGIENE: bool = True
 CONTEXT_MAX_TOKENS: int = 80_000
+# 全局自动记忆（Dream-lite）触发参数：撑爆 90% / 切换 50%（占 CONTEXT_MAX_TOKENS 比例）。
+# 每点一个 per-session 布尔、各最多触发一次（防同一 session 反复进出反复蒸）。
+AUTO_DISTILL_OVERFLOW_RATIO: float = 0.9
+AUTO_DISTILL_SWITCH_RATIO: float = 0.5
 CONTEXT_WARN_RATIO: float = 0.8
 CONTEXT_HARD_RATIO: float = 0.95
 TOOL_OUTPUT_MAX_SINGLE_TOKENS: int = 2_000
@@ -291,40 +275,6 @@ def build_runtime_memory(
     except Exception as e:
         print(f"[main] runtime_memory 装配失败（已降级，agent 仍可正常启动）: {e}")
         return None, None, None, None
-
-
-def build_distill_pipeline(
-    store: SkillPreferenceStore,
-    audit: SkillPreferenceAuditWriter,
-) -> Optional[PreferenceDistillPipeline]:
-    """装配偏好蒸馏 pipeline：scheduler + context + 隔离子 agent runner + committer。
-
-    DASHSCOPE_API_KEY 缺失 / ENABLE_PREFERENCE_DISTILLER=False → None，
-    Harness hook 会静默跳过（向后兼容）。
-    """
-    if not ENABLE_PREFERENCE_DISTILLER:
-        return None
-    if not os.getenv("DASHSCOPE_API_KEY"):
-        return None
-    try:
-        return PreferenceDistillPipeline(
-            store=store,
-            scheduler=DistillScheduler(
-                floor=DISTILL_FLOOR,
-                cadence_turns_n=DISTILL_CADENCE_TURNS_N,
-                cadence_minutes_t=DISTILL_CADENCE_MINUTES_T,
-            ),
-            context_builder=DistillContextBuilder(),
-            runner=SubAgentRunner(llm_builder=build_subagent_llm),
-            committer=PreferenceCommitter(store, audit),
-            overlap=DISTILL_OVERLAP,
-            model=DISTILLER_MODEL,
-            provider=DISTILLER_PROVIDER,
-            max_iterations=SUBAGENT_MAX_ITERATIONS,
-        )
-    except Exception as e:
-        print(f"[main] distill pipeline 装配失败（已降级）: {e}")
-        return None
 
 
 def build_context_hygiene() -> tuple[
@@ -491,17 +441,10 @@ def main() -> int:
     if hasattr(sys.stdin, "reconfigure"):
         sys.stdin.reconfigure(encoding="utf-8", errors="replace")
 
-    # 装配顺序：reflexions → loader → runtime_memory（共享 backend） → loop
+    # 装配顺序：loader → runtime_memory（共享 backend） → loop
     # LoadSkillTool 依赖 loader 的动态 description，必须先建好 loader
     # Phase D：lesson_retriever + outcome_tracker 共享同一 SqliteBackend
-    reflexions = ReflexionStore(REFLEXIONS_DIR)
-    preference_store = SkillPreferenceStore(SKILL_PREFERENCES_PATH)
-    preference_audit = SkillPreferenceAuditWriter(SKILL_PREFERENCES_AUDIT_PATH)
-    loader = SkillLoader(
-        SKILLS_DIR,
-        reflexions_store=reflexions,
-        preference_store=preference_store,
-    )
+    loader = SkillLoader(SKILLS_DIR)
     lesson_retriever, outcome_tracker, lesson_ingestor, promotion_gate = build_runtime_memory()
     loop = build_loop(loader, lesson_retriever=lesson_retriever)
 
@@ -537,12 +480,15 @@ def main() -> int:
         else None
     )
 
-    distill_pipeline = build_distill_pipeline(preference_store, preference_audit)
-    if distill_pipeline is not None:
-        print(
-            f"[DistillPipeline] enabled: {DISTILLER_PROVIDER}/{DISTILLER_MODEL} "
-            f"(cadence={DISTILL_CADENCE_TURNS_N}turns/{DISTILL_CADENCE_MINUTES_T}min, floor={DISTILL_FLOOR})"
-        )
+    # 全局自动记忆（Dream-lite）：GlobalMemory 总建（只读也要能注入 prompt）；distiller
+    # 守 DASHSCOPE_API_KEY，缺失 → None（记忆只读、不更新）。
+    global_memory = GlobalMemory(AUTO_MEMORY_PATH)
+    global_memory_distiller = (
+        GlobalMemoryDistiller(global_memory, SubAgentRunner(llm_builder=build_subagent_llm))
+        if has_dashscope else None
+    )
+    if global_memory_distiller is not None:
+        print("[GlobalMemory] auto-distill enabled")
 
     harness = Harness(
         loop=loop,
@@ -557,10 +503,12 @@ def main() -> int:
         lesson_ingestor=lesson_ingestor,
         promotion_gate=promotion_gate,
         promotion_audit_callback=promotion_audit_callback,
-        reflexions_store=reflexions,
-        distill_pipeline=distill_pipeline,
-        preference_store=preference_store,
         session_history_warn_tokens=SESSION_HISTORY_WARN_TOKENS,
+        global_memory=global_memory,
+        global_memory_distiller=global_memory_distiller,
+        context_window_tokens=CONTEXT_MAX_TOKENS,
+        auto_distill_overflow_ratio=AUTO_DISTILL_OVERFLOW_RATIO,
+        auto_distill_switch_ratio=AUTO_DISTILL_SWITCH_RATIO,
     )
     return repl(harness)
 

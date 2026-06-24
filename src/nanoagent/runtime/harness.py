@@ -24,27 +24,23 @@ from nanoagent.runtime.token_counter import TokenCounter
 from nanoagent.skills.loader import SkillLoader
 
 if TYPE_CHECKING:
-    from nanoagent.evolution.preference_pipeline.pipeline import PreferenceDistillPipeline
-    from nanoagent.evolution.reflexion import ReflexionStore
     from nanoagent.evolution.runtime_memory.lesson_ingestor import LessonIngestor
+    from nanoagent.memory.global_memory import GlobalMemory
+    from nanoagent.memory.global_memory_distiller import GlobalMemoryDistiller
     from nanoagent.evolution.runtime_memory.outcome_tracker import OutcomeTracker
     from nanoagent.evolution.runtime_memory.promotion_gate import (
         AuditCallback,
         PromotionGate,
     )
-    from nanoagent.evolution.skill_preference_store import SkillPreferenceStore
 
 _logger = logging.getLogger("nanoagent.harness")
 
 # 不能作为 /<skill> 快捷命令使用。
-_RESERVED_SLASH_CMDS = frozenset({"clear", "new", "sessions", "resume", "skill", "skills", "profile", "feedback", "digest"})
+_RESERVED_SLASH_CMDS = frozenset({"clear", "new", "sessions", "resume", "skill", "skills", "profile", "digest"})
 
 # /digest 发布日报时跑的 skill 与合成任务（发布是确定性命令入口，不靠自然语言猜意图）。
 _DIGEST_SKILL = "ai-digest"
 _DIGEST_TASK = "生成今日 AI 日报。"
-
-# /feedback 单 skill 上限，超出 FIFO 丢最旧——避免 SKILL.md 前置块无限膨胀。
-_FEEDBACK_MAX_PER_SKILL = 20
 
 # 单条 user message 截多长存进 session.meta.title
 _TITLE_MAX_CHARS = 50
@@ -73,6 +69,7 @@ def build_system_prompt(
     base_identity: str,
     skill_body: Optional[str],
     user_facts_block: Optional[str],
+    auto_memory_block: Optional[str] = None,
 ) -> str:
     """Compose system prompt sections, leaving datetime for MainLoop."""
     parts = [base_identity]
@@ -80,8 +77,17 @@ def build_system_prompt(
         parts.append(skill_body)
     if user_facts_block:
         parts.append(user_facts_block)
+    if auto_memory_block:
+        parts.append(auto_memory_block)
     parts.append("当前时间：{current_datetime}")
     return "\n\n".join(parts)
+
+
+# 全局自动记忆（Dream-lite）触发参数：撑爆 / 切换 阈值（占 context window 比例）。
+# 每个触发点一个 per-session 布尔、各最多触发一次——挡住"同一 session 反复进出反复蒸"。
+_AUTO_DISTILL_OVERFLOW_RATIO = 0.9
+_AUTO_DISTILL_SWITCH_RATIO = 0.5
+_CONTEXT_WINDOW_TOKENS_DEFAULT = 80_000
 
 
 class Harness:
@@ -104,10 +110,12 @@ class Harness:
         promotion_gate: Optional["PromotionGate"] = None,
         promotion_audit_callback: Optional["AuditCallback"] = None,
         session_key_prefix: str = _DEFAULT_SESSION_PREFIX,
-        reflexions_store: Optional["ReflexionStore"] = None,
-        distill_pipeline: Optional["PreferenceDistillPipeline"] = None,
-        preference_store: Optional["SkillPreferenceStore"] = None,
         session_history_warn_tokens: int = _SESSION_HISTORY_WARN_TOKENS_DEFAULT,
+        global_memory: Optional["GlobalMemory"] = None,
+        global_memory_distiller: Optional["GlobalMemoryDistiller"] = None,
+        context_window_tokens: int = _CONTEXT_WINDOW_TOKENS_DEFAULT,
+        auto_distill_overflow_ratio: float = _AUTO_DISTILL_OVERFLOW_RATIO,
+        auto_distill_switch_ratio: float = _AUTO_DISTILL_SWITCH_RATIO,
     ):
         self._loop = loop
         self._store = store
@@ -130,20 +138,17 @@ class Harness:
         # 把决策追加到 data/runtime/lessons/promotion_audit.jsonl。
         self._promotion_audit_callback = promotion_audit_callback
         self._session_key_prefix = session_key_prefix
-        # HITL feedback 通道：用户用 /feedback 显式声明的 skill 偏好（行为 / 风格 /
-        # 隐性约束），写到 ReflexionStore 的 skill scope，渲染时由 SkillLoader
-        # 注入到 SKILL.md 前置 `# 历史教训` 块。跟飞轮（trace-level lesson）
-        # 不重叠：飞轮学 tool 协议失败修复，feedback 学 skill 行为偏好。
-        self._reflexions = reflexions_store
-        # turn_end / skill_switch / session_end 触发偏好蒸馏，沉淀 NL preference summary。
-        # store 单独传一份给 /profile skill-prefs 子命令读 + 用户手动 delete。
-        # 装配时未注入 → 全套 hook 静默跳过（向后兼容）。
-        self._distill_pipeline = distill_pipeline
-        self._preference_store = preference_store
         # Session 级 context budget（最小版，对齐 nanobot：只量+提醒、不自动截断）。
         # Harness 自持一份 TokenCounter（谁用谁持），不伸手进 MainLoop 的内部字段。
         self._token_counter = TokenCounter()
         self._session_history_warn_tokens = session_history_warn_tokens
+        # 全局自动记忆（Dream-lite）：副 LLM 从对话蒸全局画像 → 独立文件 → 注入 system prompt。
+        # 物理独立于 UserFacts（手动钉）。distiller=None（未注入 / 无 API key）→ 只读不更新。
+        self._global_memory = global_memory
+        self._global_memory_distiller = global_memory_distiller
+        self._context_window_tokens = context_window_tokens
+        self._auto_distill_overflow_ratio = auto_distill_overflow_ratio
+        self._auto_distill_switch_ratio = auto_distill_switch_ratio
         self._current_skill = self._load_current_skill()
         # 启动后第一条对话消息默认开新 session——避免无意识续上次。
         # /resume / /new / /clear 任一显式动作都会把它置 False。
@@ -219,15 +224,11 @@ class Harness:
         if text.startswith("/skill "):
             name = text.split(None, 1)[1].strip()
             if name == "none":
-                self._maybe_distill(event="skill_switch")
                 self._current_skill = None
                 self._store.set_meta(self._session_key, current_skill=None)
                 return self._sys("已退出 skill 模式，回到 base。")
             if name not in self._loader.list_skills():
                 return self._sys(f"未知 skill: {name}。用 /skills 查看可用")
-            # 切走前先对**旧** skill 做一次蒸馏（信号在该 skill 上下文里最准）
-            if self._current_skill and self._current_skill != name:
-                self._maybe_distill(event="skill_switch")
             self._current_skill = name
             self._store.set_meta(self._session_key, current_skill=name)
             return self._sys(f"已切入 skill: {name}")
@@ -237,9 +238,6 @@ class Harness:
 
         if text == "/profile" or text.startswith("/profile "):
             return self._handle_profile(text)
-
-        if text == "/feedback" or text.startswith("/feedback "):
-            return self._handle_feedback(text)
 
         # /<name> shortcut for /skill <name>
         if len(text) > 1 and " " not in text:
@@ -276,9 +274,8 @@ class Harness:
 
     def _open_new_session(self) -> HarnessResponse:
         """显式 /new / /clear：创建并切换，返回用户可见的系统消息。"""
-        # 切走当前 session 前先把**当前** skill 的对话蒸一次——
-        # session_end 等价于"该 skill 的当前一段对话告一段落"，是稳定信号点
-        self._maybe_distill(event="session_end")
+        # 切走当前 session 前：够厚（≥switch 阈值）就把这段对话蒸进全局记忆。
+        self._maybe_auto_distill("switch", self._auto_distill_switch_ratio)
         new_key = self._create_and_switch_to_new_session()
         return self._sys(f"已开新会话：{new_key}（用 /sessions 查看历史会话）")
 
@@ -307,6 +304,8 @@ class Harness:
         if target_key == self._session_key:
             self._fresh_session_pending = False  # 显式表态后续在此 session 继续
             return self._sys(f"当前已是 {target_key}")
+        # 切走当前 session 前：够厚就蒸一次。
+        self._maybe_auto_distill("switch", self._auto_distill_switch_ratio)
         self._switch_session(target_key)
         self._fresh_session_pending = False
         return self._sys(f"已切回 {target_key}")
@@ -351,10 +350,6 @@ class Harness:
             return self._sys(self._render_profile_view())
 
         sub = parts[1]
-        if sub == "skill-prefs":
-            rest = parts[2] if len(parts) > 2 else ""
-            return self._handle_skill_prefs(rest.strip())
-
         if sub == "set":
             if len(parts) < 3:
                 return self._sys("用法：/profile set <key> <value>")
@@ -376,10 +371,10 @@ class Harness:
                 return self._sys(f"已删除 {key}")
             return self._sys(f"键 {key} 不存在")
 
-        return self._sys("用法：/profile [set <k> <v> | delete <k> | skill-prefs ...]")
+        return self._sys("用法：/profile [set <k> <v> | delete <k>]")
 
     def _render_profile_view(self) -> str:
-        """统一展示 user facts + distilled skill preferences（物理分开、视图统一）。"""
+        """展示全局 user facts（key: value + source）。"""
         all_facts = self._user_facts.get_all()
         lines: list[str] = []
         if all_facts:
@@ -390,190 +385,7 @@ class Harness:
             )
         else:
             lines.append("（暂无用户画像。用 /profile set <key> <value> 写入）")
-
-        if self._preference_store is not None and len(self._preference_store) > 0:
-            lines.append("")
-            lines.append("Auto-distilled skill preferences:")
-            for skill in self._preference_store.list_skills():
-                pref = self._preference_store.get(skill)
-                if pref is None:
-                    continue
-                date = pref.updated_at[:10] if pref.updated_at else "-"
-                lines.append(
-                    f"  {skill} [updated {date}, confidence={pref.confidence}]:"
-                )
-                lines.append(f"    {pref.value}")
-            lines.append(
-                "用 /profile skill-prefs delete <skill> 删单个；"
-                "/profile skill-prefs clear 全清"
-            )
         return "\n".join(lines)
-
-    def _handle_skill_prefs(self, rest: str) -> HarnessResponse:
-        """/profile skill-prefs [list | delete <skill> | clear]"""
-        if self._preference_store is None:
-            return self._sys("（skill preferences 未启用：装配时未注入 preference_store）")
-
-        if not rest or rest == "list":
-            store = self._preference_store
-            if len(store) == 0:
-                return self._sys("（暂无自动推断的 skill preferences）")
-            lines = ["Auto-distilled skill preferences:"]
-            for skill in store.list_skills():
-                pref = store.get(skill)
-                if pref is None:
-                    continue
-                date = pref.updated_at[:10] if pref.updated_at else "-"
-                lines.append(f"  {skill} [updated {date}, confidence={pref.confidence}]:")
-                lines.append(f"    {pref.value}")
-            return self._sys("\n".join(lines))
-
-        if rest == "clear":
-            n = self._preference_store.clear_all()
-            return self._sys(f"已清除全部 skill preferences（共 {n} 条）。")
-
-        tokens = rest.split(None, 1)
-        if tokens[0] == "delete":
-            if len(tokens) < 2:
-                return self._sys("用法：/profile skill-prefs delete <skill>")
-            skill = tokens[1].strip()
-            if self._preference_store.delete(skill):
-                return self._sys(f"已删除 skill={skill} 的 distilled preference。")
-            return self._sys(f"skill={skill} 没有 distilled preference 可删。")
-
-        return self._sys(
-            "用法：/profile skill-prefs [list | delete <skill> | clear]"
-        )
-
-    # ============================================================
-    # 偏好蒸馏 hook（turn_end / skill_switch / session_end → pipeline）
-    # ============================================================
-
-    def _maybe_distill(self, event: str) -> None:
-        """触发一次偏好蒸馏。fail-open。
-
-        feedback 取自 ReflexionStore；window / summary / marker 由 pipeline 自行从
-        history + meta + store 取。pipeline 返回新 marker 时写回 session.meta。
-        """
-        if self._distill_pipeline is None or not self._current_skill:
-            return
-        history = self._store.get(self._session_key)
-        if history is None:
-            return
-        feedback_history: list[str] = []
-        if self._reflexions is not None:
-            try:
-                fb = self._reflexions.read_recent("skill", self._current_skill, n=_FEEDBACK_MAX_PER_SKILL)
-                feedback_history = [r.content for r in fb]
-            except Exception:
-                feedback_history = []
-        try:
-            new_marker = self._distill_pipeline.maybe_distill(
-                skill=self._current_skill,
-                event=event,
-                history=history.get_history(),
-                meta=self._store.get_meta(self._session_key),
-                feedback_history=feedback_history,
-                now=datetime.now(),
-            )
-            if new_marker is not None:
-                self._store.set_meta(self._session_key, distill=new_marker)
-        except Exception as e:
-            _logger.warning(f"distill pipeline 异常（已 fail-open）: {e}")
-
-    # ============================================================
-    # /feedback：HITL 显式 skill 偏好反馈通道
-    # ============================================================
-    #
-    # 用户在 CLI / TG 里说 `/feedback 以后日报每条 ≤50 字`，写入当前 skill 的
-    # ReflexionStore；下次该 skill 渲染时由 SkillLoader 注入到 SKILL.md 前置
-    # 块。跟飞轮（trace-level lesson backend）不重叠——飞轮学的是 tool 调用
-    # 协议失败修复，feedback 学的是 skill 行为偏好（输出长度 / 类目排序 /
-    # 隐性约束等用户主观期望）。
-    #
-    # 设计简化（MVP）：
-    # - 只支持当前 skill scope（要先 /skill <name>）
-    # - FIFO 容量上限 _FEEDBACK_MAX_PER_SKILL（默认 20）防 SKILL.md 膨胀
-    # - 不做 LLM judge / consolidator——纯文本累积，可解释、可手动清理
-
-    def _handle_feedback(self, text: str) -> HarnessResponse:
-        """/feedback <text> | /feedback list | /feedback clear"""
-        if self._reflexions is None:
-            return self._sys("（feedback 未启用：装配时未注入 reflexions_store）")
-        if not self._current_skill:
-            return self._sys(
-                "用法：先 /skill <name> 切到具体 skill，再 /feedback <text> 写反馈"
-            )
-
-        # 拆 token：/feedback / /feedback list / /feedback clear / /feedback <free text>
-        parts = text.split(None, 1)
-        if len(parts) == 1:
-            return self._sys(
-                "用法：\n"
-                "  /feedback <text>     写一条反馈到当前 skill\n"
-                "  /feedback list       看当前 skill 的反馈历史\n"
-                "  /feedback clear      清除当前 skill 的反馈"
-            )
-
-        body = parts[1].strip()
-        if body == "list":
-            return self._feedback_list()
-        if body == "clear":
-            return self._feedback_clear()
-        return self._feedback_append(body)
-
-    def _feedback_append(self, content: str) -> HarnessResponse:
-        from nanoagent.evolution.reflexion import ReflexionRecord
-
-        skill = self._current_skill
-        assert skill is not None  # _handle_feedback 已守
-
-        existing = self._reflexions.read_recent(
-            "skill", skill, n=_FEEDBACK_MAX_PER_SKILL
-        )
-        # FIFO 容量上限：超出先 trim 保留最后 N-1 条，让出槽位给新 record。
-        if len(existing) >= _FEEDBACK_MAX_PER_SKILL:
-            keep = existing[-(_FEEDBACK_MAX_PER_SKILL - 1):]
-            self._reflexions.replace_all("skill", skill, keep)
-
-        # trace_id 用 "feedback:<timestamp>" 占位（用户反馈不绑 trace）
-        trace_id = f"feedback:{datetime.now().isoformat(timespec='seconds')}"
-        record = ReflexionRecord(
-            trace_id=trace_id,
-            scope="skill",
-            scope_target=skill,
-            content=content,
-            error_class=None,
-            context_tags={"source": "user_feedback"},
-        )
-        self._reflexions.append(record)
-        new_count = min(len(existing) + 1, _FEEDBACK_MAX_PER_SKILL)
-        return self._sys(
-            f"已记录到 skill={skill} 的反馈历史（共 {new_count} 条）。"
-            f"下次 /skill {skill} 时会注入到 SKILL.md 前置块。"
-        )
-
-    def _feedback_list(self) -> HarnessResponse:
-        skill = self._current_skill
-        assert skill is not None
-        records = self._reflexions.read_recent(
-            "skill", skill, n=_FEEDBACK_MAX_PER_SKILL
-        )
-        if not records:
-            return self._sys(f"（skill={skill} 暂无反馈）")
-        lines = [f"skill={skill} 反馈历史（最近 {len(records)} 条）："]
-        for i, r in enumerate(records, 1):
-            tag = r.context_tags.get("source", "unknown") if r.context_tags else "unknown"
-            lines.append(f"  {i}. [{r.created_at[:10]}] [{tag}] {r.content}")
-        lines.append("用 /feedback clear 清除全部")
-        return self._sys("\n".join(lines))
-
-    def _feedback_clear(self) -> HarnessResponse:
-        skill = self._current_skill
-        assert skill is not None
-        if self._reflexions.clear("skill", skill):
-            return self._sys(f"已清除 skill={skill} 的全部反馈。")
-        return self._sys(f"（skill={skill} 暂无反馈，无需清除）")
 
     # ============================================================
     # 对话路径
@@ -623,7 +435,8 @@ class Harness:
         # 非发布轮（随手查）什么副作用都不跑，结构上杜绝污染去重历史。
         if publish:
             self._run_publish_sideeffects(answer)
-        self._maybe_distill(event="turn_end")
+        # 撑爆触发：本轮结束后若上下文 ≥overflow 阈值，趁老消息被截断前先蒸一次。
+        self._maybe_auto_distill("overflow", self._auto_distill_overflow_ratio)
         content = answer if notice is None else f"{answer}\n\n{notice}"
         return HarnessResponse(
             kind="assistant",
@@ -781,8 +594,6 @@ class Harness:
         识别——不让 harness 去猜"这句是不是要正式日报"（那会重开 lexical 那条老缝）。"""
         if _DIGEST_SKILL not in self._loader.list_skills():
             return self._sys(f"未安装 skill: {_DIGEST_SKILL}，无法发布日报。")
-        if self._current_skill and self._current_skill != _DIGEST_SKILL:
-            self._maybe_distill(event="skill_switch")
         self._current_skill = _DIGEST_SKILL
         self._store.set_meta(self._session_key, current_skill=_DIGEST_SKILL)
         return self._handle_dialogue(_DIGEST_TASK, publish=True)
@@ -863,10 +674,41 @@ class Harness:
         except OSError:
             pass
 
+    def _maybe_auto_distill(self, reason: str, ratio: float) -> None:
+        """全局自动记忆触发：当前 session 上下文 ≥ ratio×窗口，且该触发点本 session 还没
+        蒸过 → 副 LLM 把当前 session 对话蒸进全局长期记忆（独立文件）。fail-open。
+
+        每个触发点（reason ∈ {overflow, switch}）一个 per-session 布尔、各最多触发一次——
+        挡住"同一 session 反复进出反复蒸"。distiller=None → 静默跳过。
+        已知局限（保守 v1）：触发后该 session 再增长的对话本轮不补蒸；填不满又没切走则不蒸
+        （nanobot Dream 同款、有意取舍）。
+        """
+        if self._global_memory_distiller is None:
+            return
+        flag_key = f"auto_distilled_{reason}"
+        if self._store.get_meta(self._session_key).get(flag_key):
+            return  # 该触发点本 session 已蒸过
+        history = self._store.get(self._session_key)
+        if history is None:
+            return
+        msgs = history.get_history()
+        if not msgs:
+            return
+        hist_tokens = self._token_counter.count_messages(msgs)
+        if hist_tokens < ratio * self._context_window_tokens:
+            return
+        try:
+            self._global_memory_distiller.distill(msgs)
+        except Exception as e:
+            _logger.warning(f"[global-memory] {reason} 蒸馏异常（已 fail-open）: {e}")
+        # 不论成败都置位——best-effort，避免反复重蒸同一 session。
+        self._store.set_meta(self._session_key, **{flag_key: True})
+
     def _compose_system_prompt(self) -> str:
         skill_body = self._loader.render(self._current_skill) if self._current_skill else None
         facts_block = self._user_facts.render_block() or None
-        return build_system_prompt(self._base_identity, skill_body, facts_block)
+        auto_block = (self._global_memory.render_block() or None) if self._global_memory else None
+        return build_system_prompt(self._base_identity, skill_body, facts_block, auto_block)
 
     def _load_current_skill(self) -> Optional[str]:
         """Restore pinned skill from session metadata."""
