@@ -1,81 +1,153 @@
 # nanoagent
 
-> 超轻量 agent 框架 —— LLM 全权决策的 tool-use 主循环 + 两层反馈学习（失败 → lesson、对话 → 偏好），并附一个完整的 AI 日报 Telegram Bot 作为 reference implementation。
+`nanoagent` 是一个基于 native function calling 的 agent 系统。在工具调用之外，它在运行期持续沉淀可复用状态：从失败轨迹中提炼修复经验（lesson），从长期对话中蒸馏用户记忆，并预留 skill methodology refinement，用于基于运行反馈优化已有 skill 的使用方式。
 
-## 特点
+## 特性
 
-- **两层反馈学习**：系统层从失败 trace 沉淀 lesson、同类失败时召回；用户层从对话蒸馏 skill 偏好、作软指导注入。规则驱动，无额外 LLM consolidator。
-- **层次化失败处理**：工具失败先由确定性机制处理（熔断、退避、失败计数防循环）；修复经验事后从运行记录里提炼，下次同类失败时作为提示召回。LLM 反思只在很窄的条件下参与，且它的建议要经实际运行验证才算数。
-- **闭环应用体验**：Telegram Bot + 主动日报 + HITL 反馈，日报能力封装为SKill： `skills/ai-digest`。
-- **简易Evaluation**：`evals/` 用跨 model ablation 量反馈学习前后的差异。
+`nanoagent` 当前聚焦单 agent 主循环和运行期自我改进，不是多 agent 编排框架。核心能力包括：
+
+- **双层运行期学习**：系统层把失败运行记录转成可检索 lesson，在相似错误复现时召回，用运行结果继续校准其有效性；skill 侧预留 methodology refinement，用于基于运行反馈自主调整已有 skill 的使用方式。用户层把长期对话中的身份、偏好和目标压缩成可持久化用户记忆，在跨 session 对话中作为软指导注入。
+- **Native function-calling agent loop**：基于模型原生 tool call 的循环，由模型持续决策下一步动作，runtime 负责执行、观察、上下文管理和收束。
+- **统一工具抽象**：tool、skill、MCP、SubAgent 都作为可声明、可调用、可观测的 action 接入主循环。
+- **轻量本地持久化**：session、用户记忆和 lesson 主要落在本地文件 / SQLite，默认不引入向量数据库。
+- **消息网关解耦**：CLI、one-shot、Telegram 等 channel 只负责接入和路由，主循环、状态和记忆留在 Harness / runtime 内部。
+- **可观测性**：建立 log、metrics、trace / trajectory 组件，用于复盘运行过程、定位失败原因，并支撑后续 evaluation。
+
+## Agent Loop
+
+`nanoagent` 的主循环围绕“决策—执行—观察—留痕”运转：模型基于当前 session、可用工具和运行期反馈持续选择下一步动作；runtime 负责把动作落到 tool、skill、MCP 或 SubAgent 上，并把过程记录成 trace。
+
+```text
+user task
+  -> MainLoop
+  -> tool / skill / MCP / SubAgent
+  -> observation
+  -> failure memory / critic / context budget
+  -> answer
+  -> trace
+```
+
+trace 不只是日志，也是后续学习和评测的输入。失败相关轨迹会被压缩成 lesson，在相似场景中召回，并通过后续运行结果继续校准。
+
+```text
+failed trace
+  -> episode
+  -> candidate lesson
+  -> promote / retire
+  -> retrieval
+  -> outcome tracking
+```
+
+lesson 不是聊天记录里的“反思文本”，而是带触发条件、状态和效果回写的运行期对象。
+
+## 参考实现：AI 日报推送
+
+`skills/ai-digest` 是基于 `nanoagent` 构建的参考实现：它会持续抓取 AI 领域候选信息，做去重、筛选、评审，并通过 Telegram channel 发布。
+
+这个场景足够简单，也足够接近真实长期任务：有稳定输入、重复内容、来源污染、用户偏好和实际发布动作，并且可以日常运行。它会持续产生可观察的 trace，用来检验框架的学习、记忆和可靠性机制是否能在真实循环中成立。
+
+## 工程化验证
+
+### 消融实验
+
+**目的**：验证 lesson 飞轮是否能把一次失败转化为后续任务里的行为改善。
+
+**数据准备**：准备 5 个业务域，每个域各有 3 个学习任务和 3 个测试任务，共 15 个学习场景、15 个测试场景。学习和测试使用不同对象、不同错误表述，但隐藏规则属于同一类问题，避免测试阶段只是复现训练样本。
+
+**实验方法**：每个测试任务重复运行 3 次，同时记录单次成功率和 pass^3 稳定性；对比三种条件：
+
+- **OFF**：不召回经验。
+- **ON**：从学习任务自动沉淀的 lesson，再在测试任务召回。
+- **ORACLE**：人工写的 gold lesson，作为经验质量上限。
+
+| 模型 | OFF | ON (pass^1) | ON (pass^3) | ORACLE |
+|---|---:|---:|---:|---:|
+| gpt-5.4-mini | 0.00 | 0.80 | 0.67 | 0.98 |
+| qwen3.6-plus | 0.00 | **1.00** | **1.00** | 1.00 |
+| claude-sonnet-4-6 | 0.00 | 0.80 | 0.80 | 0.85 |
+
+| 模型 | OFF 平均步数 | ON 平均步数 | OFF 平均 token | ON 平均 token |
+|---|---:|---:|---:|---:|
+| gpt-5.4-mini | 17.3 | 17.0 | 11,015 | 10,238 |
+| qwen3.6-plus | 25.2 | 16.8 | 19,363 | 11,167 |
+| claude-sonnet-4-6 | 15.1 | 15.5 | 16,200 | 15,850 |
+
+> 观察到 OFF 和 ON 在一些模型上的平均步数 / token 差距不大；但关键差别在于 OFF 为失败空转成本，ON 能把任务完成。
+
+> 受控合成实验：它证明 lesson 飞轮能学习并迁移“隐藏参数 / 本地规则”这一类失败，不等于能解决所有真实世界失败。
+
+### 多轮状态评测
+
+**目的**：验证 agent 在多轮用户交互中，能不能稳定地调用工具、遵守流程，并把任务结束后的系统状态改对，而不是只生成看起来合理的回复。
+
+**数据准备**：基于 AI 日报推送场景合成 6 类多轮任务，覆盖发布前修订、来源核验、历史去重、重复发布幂等、故障恢复和中断后恢复。每类任务设计 2 个不同实例；内容源来自预采集真实数据的本地回放。每次测试运行都使用独立临时环境，避免污染真实数据，也便于检查最终状态。
+
+**实验方法**：用 user simulator 驱动被测 agent 多轮对话；每个任务重复运行 3 次，检查最终状态和真实副作用。
+
+| 模型 | 任务成功率 | pass^3 通过 | 结束状态正确率 | 平均轮数 | 平均 token |
+|---|---:|---:|---:|---:|---:|
+| qwen3.6-plus | 36/36 = 100% | 12/12 | 36/36 = 100% | 4.33 | 101,981 |
+| gpt-5.4-mini | 31/36 = 86.1% | 8/12 | 32/36 = 88.9% | 4.00 | 84,486 |
+| claude-sonnet-4-6 | 35/36 = 97.2% | 11/12 | 35/36 = 97.2% | 4.19 | 128,581 |
+
+> 本地模拟评测：它借鉴 τ-bench 的多轮 user simulator 与最终状态判分思路，但不和 τ-bench 官方结果做横向比较，也不代表开放世界长期可靠性。
 
 ## 快速开始
 
-需要 [uv](https://github.com/astral-sh/uv) 和 Python ≥ 3.11。
+需要 [uv](https://github.com/astral-sh/uv) 和 Python >= 3.11。
 
 ```bash
-uv venv && uv pip install -e .          # 装框架
-cp .env.example .env                     # 填 OPENAI_API_KEY 等（见下）
-uv run python main.py                     # 启动 CLI REPL
+uv venv
+uv pip install -e .
+cp .env.example .env
+uv run python main.py
 ```
 
-`.env` 至少需要一个 OpenAI 兼容 provider 的 key。主 LLM 走 `OPENAI_API_KEY` + `OPENAI_BASE_URL`（默认模型见 `main.py` 顶部常量）；副 LLM（日报评审 / 偏好蒸馏 / 在线微反思）可选 `DASHSCOPE_API_KEY`，缺失则自动降级跳过。provider 支持 openai / dashscope / dashscope_us / anthropic / zhipu / deepseek / ollama / vllm 等多端点（偏好蒸馏可走中立第三方）。
+`.env` 至少需要一个 OpenAI 兼容 provider 的 key。主 LLM 使用 `OPENAI_API_KEY` 和 `OPENAI_BASE_URL`；默认模型在 `main.py` 顶部常量里配置。副 LLM 用于日报评审和全局记忆蒸馏，可选 `DASHSCOPE_API_KEY`，缺失时自动跳过对应能力。
 
-跑 ai-digest skill 或 Telegram bot 时按需装 extra：
+运行 AI 日报 skill 或 Telegram bot：
 
 ```bash
-uv pip install -e ".[digest]"            # ai-digest skill 依赖
-uv pip install -e ".[telegram]"          # Telegram channel 依赖
-uv run python run_bot.py                  # 启动 Telegram bot（需 TELEGRAM_BOT_TOKEN）
+uv pip install -e ".[digest]"
+uv pip install -e ".[telegram]"
+uv run python run_bot.py
+```
+
+Telegram bot 需要 `TELEGRAM_BOT_TOKEN`；可选 `TELEGRAM_CHAT_ID` 做白名单，`TELEGRAM_DIGEST_AT=HH:MM` 开启进程内每日定时推送。
+
+如需接入通用 MCP server auto-expand：
+
+```bash
+uv pip install -e ".[mcp]"
 ```
 
 ## 项目结构
 
-```
+```text
 src/nanoagent/
-├ core/        LLM client / message / provider / logger / paths / trace schema
-├ tool/        BaseTool + registry
-├ runtime/     主循环 + telegram channel
-├ skills/      渐进披露的 skill loader
-├ memory/      UserFacts 用户画像
-├ evolution/   反馈学习飞轮（trace → lesson → 状态机 → 召回）+ 滚动偏好蒸馏 pipeline
-│              + 层次化处理（online_reflector 在线反思 / offline_mint + reflector 离线教训）
-└ lesson/      lesson 运维 CLI（手动 promote / retire / list）
+├ core/        LLM client / provider / message / logger / trace schema
+├ tool/        BaseTool + registry；fetch / search / grep / glob / skill_exec / mcp_tool
+├ runtime/     MainLoop / Harness / session / context budget / critic / telegram channel
+├ skills/      skill loader / metadata lazy loading / coverage contract
+├ memory/      UserFacts / global memory distillation
+├ evolution/   trace -> episode -> lesson -> promotion -> retrieval -> outcome tracking
+└ lesson/      lesson 运维 CLI
 
-main.py             CLI 薄壳（装配 + REPL / one-shot）
-run_bot.py          Telegram channel 薄壳
-run_offline_mint.py 离线 mint 批跑入口（从已观测恢复产教训）
-skills/ai-digest/   reference skill：AI 日报抓取 / 去重 / 评审
+main.py             CLI REPL / one-shot 入口
+run_bot.py          Telegram bot 入口
+skills/ai-digest/   AI 日报 reference skill
+evals/              failure-learning 与状态化多轮评测
+docs/               设计记录、实验报告和重构笔记
 ```
 
-## 反馈学习
+## 测试
 
-两个轴：从**失败**学（系统层）+ 从**对话**学用户偏好（用户层）。
-
-**系统层** —— 把每次失败留下的 trace 当作可复用经验，自动沉淀成下次能召回的 lesson：
-
-```
-跑任务 → 失败写进 trace
-      → EpisodeExtractor 抽出结构化 episode（失败后的成功恢复自动配对为修复证据）
-      → LessonGenerator 生成 candidate lesson（按失败原因聚合，含结构化修复示例）
-      → PromotionGate 状态机：candidate → probation → promoted（或 retired）
-      → 下次同类失败时 LessonRetriever 召回，把修复 hint 注入上下文
-      → OutcomeTracker 回写 helped / hurt / ineffective，闭环
+```bash
+uv run python -m pytest -q
 ```
 
-lesson 全程持久化在 SQLite，进程重启不丢；阈值可由 `NANOAGENT_PROMOTION_*` 环境变量覆盖。
+Codex 环境里如果默认临时目录权限异常，可以显式指定仓库内临时目录：
 
-**用户层** —— 一个隔离的副 agent 把近期对话蒸成 skill 级 NL 偏好 summary，经语义闸门 + 存储硬校验后落盘，下次进该 skill 时作为软指导注入；在 turn / skill / session 边界按节奏触发，保守写入。
-
-## 本地评估
-
-评估基于确定性故障注入，主模型采用 Qwen3.6-Plus，Reflector 和 Distiller 采用 Qwen3.6-Flash，用户层 LLM judge 采用 Claude Sonnet 4.6。共150 次试验：50 个任务 × 关学习 / 开学习 / 人工写好教训三部分。数字仅供参考：
-
-| 指标          | 关     | 开           |
-| ----------- | ----- | ----------- |
-| 工具调用成功率     | 71%   | 81%         |
-| 单任务平均步数     | 30.5  | 24.0（−21%）  |
-| 单任务平均 token | 30.5k | 22.4k（−27%） |
-| 单任务平均耗时     | 21.2s | 13.9s（−34%） |
-
-用户层偏好做过消融对照：偏好摘要 + 应用契约逐层加上后，LLM 盲评的贴合偏好评分由 1/5 升至 4/5，且随注入深度单调。
+```bash
+.\.venv\Scripts\python.exe -m pytest -q --basetemp=.\.pytest_tmp_codex
+```
