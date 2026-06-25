@@ -41,6 +41,12 @@ telegram = [
     "python-telegram-bot>=22.7",
     "python-dotenv>=1.0",
 ]
+# MCP client + MCPTool（src/nanoagent/mcp/client.py、src/nanoagent/tool/mcp_tool.py）依赖。
+# 激活：`uv pip install -e ".[mcp]"`。fastmcp 是高层 MCP 客户端（吃标准 MCPConfig、自动
+# 管传输 / 多 server），会顺带带上主依赖里的官方 mcp。
+mcp = [
+    "fastmcp>=3.0",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
