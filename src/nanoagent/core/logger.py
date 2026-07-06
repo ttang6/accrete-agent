@@ -291,6 +291,7 @@ class RunTracer:
             return None
 
         total_ms = round((time.time() - self._start_time) * 1000)
+        self._maybe_emit_otel()
 
         if self._stream_file:
             # 在文件末尾追加一个 summary 条目，便于事后定位完成状态
@@ -336,6 +337,22 @@ class RunTracer:
         logger = get_logger(self.agent_name)
         logger.info(f"轨迹已保存: {trace_file} ({len(self.steps)} 步, {total_ms}ms)")
         return trace_file
+
+    def _maybe_emit_otel(self) -> None:
+        """收尾时把本次 run 的事件导成 OTel GenAI span（互操作层，见 observability.otel_export）。
+
+        守 NANOAGENT_OTEL + opentelemetry 可导入；否则静默 no-op。fail-open：任何异常
+        不影响 trace 落盘 / 主流程。内部 jsonl（喂飞轮/eval）不受影响。
+        """
+        try:
+            from nanoagent.observability import otel_export
+            if otel_export.is_enabled():
+                otel_export.emit_run(
+                    self.agent_name, self.user_input, self._start_time,
+                    self.steps, self._token_summary,
+                )
+        except Exception:
+            pass
 
     def __enter__(self) -> "RunTracer":
         return self

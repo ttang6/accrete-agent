@@ -47,6 +47,14 @@ telegram = [
 mcp = [
     "fastmcp>=3.0",
 ]
+# OTel GenAI 语义约定导出（src/nanoagent/observability/otel_export.py）。
+# 激活：`uv pip install -e ".[otel]"`。可观测互操作层——把 trace 导成行业标准
+# OTel span，任何 OTel 后端（Jaeger / CozeLoop / LoongSuite）可直接吃。默认不装、
+# 默认不开（守 NANOAGENT_OTEL 环境变量）；缺依赖时导出静默 no-op，不影响主流程。
+otel = [
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp-proto-http>=1.20",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
