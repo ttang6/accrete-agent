@@ -3,15 +3,17 @@
 职责：
 - 读 trace（JSONL 文件 or events list）
 - 调 EpisodeExtractor 把含 failure 的 trace 转成 RuntimeEpisode
-- 调 TraceErrorClassifier 把每个 failure 分类
-- 调 LessonGenerator 产 candidate lesson
+- 调 TraceErrorClassifier 把每个 failure 分类成单轨 base 标签
+- 按 `_ONLINE_PRODUCERS` 声明式注册表分派:有本地 oracle 的类（schema_mismatch）
+  产 candidate lesson,无 oracle 的类显式 abstain（走离线 / 处置机制）
 - upsert 进 backend：先 add_lesson，已存在则 extend_lesson_evidence 累加 evidence
 
 设计要点：
 - 封装 4 个组件（extractor / classifier / generator / backend），Harness 只接一个 ingestor
 - 幂等：_processed_paths set 防同一 trace 重复 ingest（同 OutcomeTracker 模式）
 - Fail-open：任何异常路径返回 IngestResult.error，不阻塞 user-turn 主流程
-- 不主动状态机流转——所有新生成的 lesson 都是 CANDIDATE，等 PromotionGate 升级
+- 不主动改注入资格——新 lesson 出生即 score=INIT=T（结构性试用期,直接可召回）,
+  后续 helped/hurt 账本由 OutcomeTracker 写、lesson_score 现算注入分
 - 不消费 ACTION_LESSON_USED——那是 OutcomeTracker 的职责，两者读 disjoint 维度
 
 为什么独立成一个类而不是 Harness 直接调 4 个组件：
@@ -33,14 +35,29 @@ from nanoagent.evolution.runtime_memory.backend import (
 )
 from nanoagent.evolution.runtime_memory.episode_extractor import EpisodeExtractor
 from nanoagent.evolution.runtime_memory.lesson_generator import (
-    LessonGenerator,
-    _cause_signature,
+    _failure_reason,
+    build_schema_lesson,
 )
 from nanoagent.evolution.runtime_memory.trace_error_classifier import (
     TraceErrorClassifier,
 )
 
 _logger = logging.getLogger("nanoagent.lesson_ingestor")
+
+
+# 声明式生产者注册表 —— "oracle 门控生产"的一页式证据（键重构·刀3·3f）。
+# 每个 failure_class 显式声明自己有没有本地 oracle:
+# - schema_mismatch → build_schema_lesson（oracle = 校验器给的 required_fields）
+# - 其余类 → 不注册 = 显式 abstain（代码里看得见的分支,不是沉默的"没被调用"）:
+#     transient  → 处置机制是重试（in-tool 退避）,不产 lesson
+#     unknown    → 无 oracle,诚实弃权,交离线 grounded Reflector（观测到恢复才产）
+#     soft_quality_issue / semantic_failure
+#                → turn 末质量时刻,移出工具失败召回路径,作离线 methodology 输入（3b）
+# 键构造 + 入库方翻译住这层公共设施:生产者按 base 标签（= 热路径召回时会打出的键）
+# 分派,存进 lesson 的键即热路径查得到的键——桥拆掉后无需再翻译。
+_ONLINE_PRODUCERS = {
+    "schema_mismatch": build_schema_lesson,
+}
 
 
 @dataclass(frozen=True)
@@ -66,11 +83,10 @@ class LessonIngestor:
     线程安全：内部 _processed_paths 是 set，单进程读写不需锁。
     """
 
-    def __init__(self, backend: MemoryBackend, *, ttl_days: int = 14):
+    def __init__(self, backend: MemoryBackend):
         self._backend = backend
         self._extractor = EpisodeExtractor()
         self._classifier = TraceErrorClassifier()
-        self._generator = LessonGenerator(ttl_days=ttl_days)
         self._processed_paths: Set[str] = set()
 
     def process_trace_path(self, path: Path) -> IngestResult:
@@ -114,13 +130,21 @@ class LessonIngestor:
         extended = 0
         for fe in episode.failures:
             try:
-                error_class = self._classifier.classify(fe, episode.failures)
-                lesson = self._generator.generate(episode, fe, error_class)
-                # 键审计：cause_sig 错位（错分类/提取失败）比 args_hash 键更隐蔽，
+                failure_class = self._classifier.classify(fe, episode.failures)
+                producer = _ONLINE_PRODUCERS.get(failure_class)
+                if producer is None:
+                    # 显式 abstain：无本地 oracle 的类不由模板在线产（走离线 / 处置机制）
+                    _logger.info(
+                        f"lesson abstain: class={failure_class} tool={fe.op} "
+                        f"（无在线 oracle,交离线 grounded Reflector / 处置机制）"
+                    )
+                    continue
+                lesson = producer(episode, fe)
+                # 键审计：failure_reason 错位（错分类/提取失败）比 args_hash 键更隐蔽，
                 # 留四元组日志可查
                 _logger.info(
-                    f"lesson key: id={lesson.lesson_id} tool={fe.tool_key} "
-                    f"class={error_class} sig={_cause_signature(fe, error_class)!r} "
+                    f"lesson key: id={lesson.lesson_id} tool={fe.op} "
+                    f"class={failure_class} sig={_failure_reason(fe, failure_class)!r} "
                     f"args_hash={fe.args_hash}"
                 )
             except Exception as e:

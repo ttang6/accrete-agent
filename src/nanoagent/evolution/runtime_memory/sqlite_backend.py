@@ -6,7 +6,7 @@ InMemoryMemoryBackend 重启即丢；SqliteMemoryBackend 用 SQLite 文件做真
 设计要点：
 - 2 表：`runtime_episodes` + `runtime_lessons`
 - 完整 dataclass 序列化进 `payload_json` 列（schema 演进零 ALTER TABLE 成本）
-- 高频 filter 字段（status / error_class / tool_name / expires_on / confidence / updated_at）
+- 高频 filter 字段（status / failure_class / op / updated_at）
   提前出来做 SQL pre-cut + indexed
 - 复杂 filter 表达式（嵌套 OR/NOT、点号路径）→ 客户端 `_match` 复用 InMemory 的实现
   保证两个 backend 行为零差异
@@ -34,7 +34,6 @@ from nanoagent.evolution.runtime_memory.backend import (
 from nanoagent.evolution.runtime_memory.inmemory_backend import _match
 from nanoagent.evolution.runtime_memory.schema import (
     LessonStats,
-    LessonStatus,
     RuntimeEpisode,
     RuntimeLesson,
 )
@@ -47,12 +46,9 @@ DEFAULT_DB_PATH: Path = Path("data/runtime/lessons/runtime_memory.sqlite")
 # 路径与 RuntimeLesson 的 dataclass attr 一致（`trigger.X` 走嵌套）——
 # 单一来源避免与客户端 `_match` 路径解析双轨。
 _INDEXED_FIELDS_TO_COLUMNS: Dict[str, str] = {
-    "status": "status",
-    "expires_on": "expires_on",
-    "confidence": "confidence",
     "updated_at": "updated_at",
-    "trigger.error_class": "error_class",
-    "trigger.tool_name": "tool_name",
+    "trigger.failure_class": "failure_class",
+    "trigger.op": "op",
 }
 
 _SCHEMA_DDL: str = """
@@ -66,19 +62,13 @@ CREATE TABLE IF NOT EXISTS runtime_episodes (
 CREATE TABLE IF NOT EXISTS runtime_lessons (
     lesson_id    TEXT PRIMARY KEY,
     payload_json TEXT NOT NULL,
-    status       TEXT NOT NULL,
-    error_class  TEXT NOT NULL,
-    tool_name    TEXT,
-    expires_on   TEXT,
-    confidence   REAL DEFAULT 0.0,
+    failure_class  TEXT NOT NULL,
+    op    TEXT,
     updated_at   TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_lessons_status     ON runtime_lessons(status);
-CREATE INDEX IF NOT EXISTS idx_lessons_expires    ON runtime_lessons(expires_on);
-CREATE INDEX IF NOT EXISTS idx_lessons_tool       ON runtime_lessons(tool_name);
-CREATE INDEX IF NOT EXISTS idx_lessons_err_class  ON runtime_lessons(error_class);
-CREATE INDEX IF NOT EXISTS idx_lessons_confidence ON runtime_lessons(confidence);
+CREATE INDEX IF NOT EXISTS idx_lessons_op         ON runtime_lessons(op);
+CREATE INDEX IF NOT EXISTS idx_lessons_failure_class  ON runtime_lessons(failure_class);
 CREATE INDEX IF NOT EXISTS idx_lessons_updated    ON runtime_lessons(updated_at);
 """
 
@@ -189,17 +179,13 @@ class SqliteMemoryBackend(MemoryBackend):
         payload = json.dumps(lesson.to_dict(), ensure_ascii=False)
         self._conn.execute(
             "INSERT INTO runtime_lessons "
-            "(lesson_id, payload_json, status, error_class, tool_name, "
-            " expires_on, confidence, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "(lesson_id, payload_json, failure_class, op, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
             (
                 lesson.lesson_id,
                 payload,
-                lesson.status.value,
-                lesson.trigger.error_class,
-                lesson.trigger.tool_name,
-                lesson.expires_on,
-                lesson.confidence,
+                lesson.trigger.failure_class,
+                lesson.trigger.op,
                 lesson.updated_at,
             ),
         )
@@ -242,39 +228,20 @@ class SqliteMemoryBackend(MemoryBackend):
         self,
         lesson_id: str,
         *,
-        status: Optional[LessonStatus] = None,
         stats: Optional[LessonStats] = None,
-        expires_on: Optional[str] = None,
-        confidence: Optional[float] = None,
     ) -> RuntimeLesson:
-        # 状态机校验在 ABC 模板方法 update_lesson_metadata 已处理
         assert self._conn is not None
         lesson = self.get_lesson(lesson_id)
         if lesson is None:
             raise LessonNotFound(f"lesson_id={lesson_id!r} not found")
-        if status is not None:
-            lesson.status = status
         if stats is not None:
             lesson.stats = stats
-        if expires_on is not None:
-            lesson.expires_on = expires_on
-        if confidence is not None:
-            lesson.confidence = confidence
         lesson.updated_at = _now_iso()
         payload = json.dumps(lesson.to_dict(), ensure_ascii=False)
         self._conn.execute(
-            "UPDATE runtime_lessons SET "
-            "payload_json = ?, status = ?, expires_on = ?, "
-            "confidence = ?, updated_at = ? "
+            "UPDATE runtime_lessons SET payload_json = ?, updated_at = ? "
             "WHERE lesson_id = ?",
-            (
-                payload,
-                lesson.status.value,
-                lesson.expires_on,
-                lesson.confidence,
-                lesson.updated_at,
-                lesson_id,
-            ),
+            (payload, lesson.updated_at, lesson_id),
         )
         return lesson
 
@@ -316,15 +283,6 @@ class SqliteMemoryBackend(MemoryBackend):
             (payload, lesson.updated_at, lesson_id),
         )
         return lesson
-
-    def list_expired(self, today_iso: str) -> List[RuntimeLesson]:
-        assert self._conn is not None
-        rows = self._conn.execute(
-            "SELECT payload_json FROM runtime_lessons "
-            "WHERE expires_on < ? AND status != ?",
-            (today_iso, LessonStatus.EXPIRED.value),
-        ).fetchall()
-        return [RuntimeLesson.from_dict(json.loads(r[0])) for r in rows]
 
     def delete_lesson(self, lesson_id: str) -> bool:
         assert self._conn is not None

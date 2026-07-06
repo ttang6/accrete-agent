@@ -42,7 +42,7 @@ class ReflectionResult:
 
 
 def _parse_tool_call(ev: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-    """tool_call_end 事件 → (tool_key, args dict)。与 episode_extractor 同口径
+    """tool_call_end 事件 → (op, args dict)。与 episode_extractor 同口径
     （skill_exec 用 skill/script 前缀，其它用裸 tool 名）。"""
     tool = ev.get("tool", "unknown")
     raw = ev.get("input", "") or ""
@@ -62,7 +62,7 @@ def _parse_tool_call(ev: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
 def find_observed_recovery(
     events: List[Dict[str, Any]], failure: FailureEvent
 ) -> Optional[Dict[str, Any]]:
-    """在失败之后，找同一 tool_key 第一次**成功**的 tool_call_end，返回其 args dict。
+    """在失败之后，找同一 op 第一次**成功**的 tool_call_end，返回其 args dict。
 
     没有 → None（= 这次失败没被恢复，无 grounding，调用方应弃权产 grounded lesson）。
     这就是"在轨恢复验证门"：只认 trace 里实际重执行成功的硬证据，不靠 LLM 猜。
@@ -72,7 +72,7 @@ def find_observed_recovery(
         if ev.get("action") != ts.ACTION_TOOL_CALL_END:
             continue
         key, args = _parse_tool_call(ev)
-        if key != failure.tool_key:
+        if key != failure.op:
             continue
         out = ev.get("output", "") or ""
         if not seen_failure:
@@ -94,7 +94,7 @@ _REFLECT_INSTRUCTION = """你是一个离线的"失败复盘器"(Reflector)。�
 让 agent 下次遇到同类失败时能直接照做。
 
 【失败】
-- 工具: {tool_key}
+- 工具: {op}
 - 错误类型: {error_type}
 - 错误信息: {error_message}
 - 失败时参数: {failed_args}
@@ -112,14 +112,14 @@ _REFLECT_INSTRUCTION = """你是一个离线的"失败复盘器"(Reflector)。�
 规则：
 - 只基于上面观测，不编造没发生的步骤。
 - 若失败参数与恢复参数**相同** → 这是瞬时故障，recommendation 应说"直接原样重试，勿降级跳过"。
-- suggested_action 必须是一个具体可照抄的正确调用（skill/script 来自 tool_key，args 取恢复参数）。"""
+- suggested_action 必须是一个具体可照抄的正确调用（skill/script 来自 op，args 取恢复参数）。"""
 
 _SOFT_INSTRUCTION = """你是一个离线的"失败复盘器"(Reflector)。给你一次 agent 运行里的【一个工具失败】，\
 但这次**没有观测到后续成功的恢复**。请基于失败信息给一条 best-effort 的猜测性建议——\
 明确这是未经验证的猜测。
 
 【失败】
-- 工具: {tool_key}
+- 工具: {op}
 - 错误类型: {error_type}
 - 错误信息: {error_message}
 - 失败时参数: {failed_args}
@@ -163,7 +163,7 @@ class Reflector:
         LLM 输出解析失败 → None。
         """
         prompt = _REFLECT_INSTRUCTION.format(
-            tool_key=failure.tool_key,
+            op=failure.op,
             error_type=failure.error_type,
             error_message=failure.error_message[:200],
             failed_args=_failed_args(failure),
@@ -184,7 +184,7 @@ class Reflector:
         """软（无 grounding）反思：无观测恢复时的 best-effort 猜测。产物只能进
         物理旁路 jsonl（见 offline_mint），不进 backend、不被召回。suggested_action 恒 None。"""
         prompt = _SOFT_INSTRUCTION.format(
-            tool_key=failure.tool_key,
+            op=failure.op,
             error_type=failure.error_type,
             error_message=failure.error_message[:200],
             failed_args=_failed_args(failure),

@@ -17,11 +17,10 @@ InMemoryMemoryBackend 跑通 policy；SqliteMemoryBackend 作为持久化默认�
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, FrozenSet, List, Optional
+from typing import Any, Dict, List, Optional
 
 from nanoagent.evolution.runtime_memory.schema import (
     LessonStats,
-    LessonStatus,
     RuntimeEpisode,
     RuntimeLesson,
 )
@@ -44,44 +43,8 @@ class LessonAlreadyExists(RuntimeMemoryError):
     """add_lesson 时 lesson_id 已存在。upsert 走 update_lesson_metadata。"""
 
 
-class IllegalStatusTransition(RuntimeMemoryError):
-    """update_lesson_metadata 收到非法 status 转移时 raise。"""
-
-
-# ============================================================
-# 状态机：合法转移表
-# ============================================================
-#
-# 出边为空 = 终态；自环（X → X）按定义非法（表里不写自环条目）。
-# CLI 通过 promote/retire/reset/expire 4 个动作走这些转移；
-# OutcomeTracker 走 status=None 路径，不进 validator。
-LEGAL_TRANSITIONS: Dict[LessonStatus, FrozenSet[LessonStatus]] = {
-    LessonStatus.CANDIDATE: frozenset({
-        LessonStatus.PROBATION,  # 先升 PROBATION 试用，不直接 PROMOTED
-        LessonStatus.PROMOTED,   # 保留：管理 CLI 可手动直 promote（紧急场景）
-        LessonStatus.RETIRED, LessonStatus.EXPIRED,
-    }),
-    LessonStatus.PROMOTED: frozenset({
-        LessonStatus.RETIRED, LessonStatus.CANDIDATE, LessonStatus.EXPIRED,
-    }),
-    LessonStatus.RETIRED: frozenset({
-        LessonStatus.CANDIDATE, LessonStatus.EXPIRED,
-    }),
-    LessonStatus.EXPIRED: frozenset(),  # 终态
-    LessonStatus.PROBATION: frozenset({
-        LessonStatus.PROMOTED, LessonStatus.RETIRED,
-        LessonStatus.CANDIDATE, LessonStatus.EXPIRED,
-    }),
-}
-
-
-def validate_status_transition(from_: LessonStatus, to: LessonStatus) -> None:
-    """raise IllegalStatusTransition if (from_ → to) not allowed."""
-    allowed = LEGAL_TRANSITIONS.get(from_, frozenset())
-    if to not in allowed:
-        raise IllegalStatusTransition(
-            f"非法状态转移：{from_.value} → {to.value}（合法目标：{sorted(s.value for s in allowed) or '无（终态）'}）"
-        )
+# 状态机已删（lesson_score 单分数治理取代 candidate/promoted/retired 转移表）：
+# lesson 只存账本,注入资格 = score ≥ T 现算,无存储态、无转移校验。
 
 
 # ============================================================
@@ -146,7 +109,7 @@ class MemoryBackend(ABC):
                      | { "OR":  [filter, ...] }
                      | { "NOT": filter }
 
-        字段路径用点号支持嵌套：`"trigger.tool_name"` / `"status"`——
+        字段路径用点号支持嵌套：`"trigger.op"` / `"trigger.failure_class"`——
         与 RuntimeLesson dataclass attr 路径一一对应（避免双轨）。
         `query` 当前在 InMemory + SQLite 走 advice substring fallback（memory_text
         已删）；未来增强（FTS5 / sqlite-vec / 语义检索）由具体 backend 决定。
@@ -156,48 +119,24 @@ class MemoryBackend(ABC):
         self,
         lesson_id: str,
         *,
-        status: Optional[LessonStatus] = None,
         stats: Optional[LessonStats] = None,
-        expires_on: Optional[str] = None,
-        confidence: Optional[float] = None,
     ) -> RuntimeLesson:
         """部分字段更新；不存在 raise LessonNotFound。返回更新后的 lesson。
         None 字段表示 "不动"，不是 "清空"。
 
-        模板方法（concrete）：
-        - 若 `status is not None`：先 get_lesson 取当前态 + validate_status_transition；
-          status=None（OutcomeTracker 路径）跳过 validator——这是显式契约。
-        - 通过后 dispatch 给具体 backend 的 `_apply_lesson_metadata`。
-
-        非法转移 raise IllegalStatusTransition；lesson_id 不存在 raise LessonNotFound。
-        confidence 参数给 OutcomeTracker / PromotionGate 显式更新；不要靠 mutate
-        get_lesson 返回的对象（实现保证别名隔离）。"""
-        if status is not None:
-            current = self.get_lesson(lesson_id)
-            if current is None:
-                raise LessonNotFound(f"lesson_id={lesson_id!r} not found")
-            validate_status_transition(current.status, status)
-        return self._apply_lesson_metadata(
-            lesson_id,
-            status=status,
-            stats=stats,
-            expires_on=expires_on,
-            confidence=confidence,
-        )
+        stats 给 OutcomeTracker 显式更新账本（helped/hurt）；不要靠 mutate
+        get_lesson 返回的对象（实现保证别名隔离）。晋降退休由 lesson_score 从账本
+        派生,无 status 转移可校验。"""
+        return self._apply_lesson_metadata(lesson_id, stats=stats)
 
     @abstractmethod
     def _apply_lesson_metadata(
         self,
         lesson_id: str,
         *,
-        status: Optional[LessonStatus] = None,
         stats: Optional[LessonStats] = None,
-        expires_on: Optional[str] = None,
-        confidence: Optional[float] = None,
     ) -> RuntimeLesson:
-        """具体 backend 落盘 metadata 更新；不做 status 转移校验（已在模板方法层处理）。
-        不存在仍需 raise LessonNotFound（防御性——template 已检查但避免双 fetch
-        race / 直接调本方法时漏检）。"""
+        """具体 backend 落盘 metadata 更新。不存在 raise LessonNotFound。"""
 
     @abstractmethod
     def extend_lesson_evidence(
@@ -220,14 +159,6 @@ class MemoryBackend(ABC):
         - 不存在 raise LessonNotFound
 
         典型调用方：caller 先 add_lesson 抓 LessonAlreadyExists 后调本方法。
-        """
-
-    @abstractmethod
-    def list_expired(self, today_iso: str) -> List[RuntimeLesson]:
-        """返回 expires_on < today_iso 且 status != EXPIRED 的全部 lesson。
-
-        today_iso 形如 "YYYY-MM-DD"。后续 cleanup pruner 用此找需要 mark
-        EXPIRED 或物理删除的目标。
         """
 
     @abstractmethod

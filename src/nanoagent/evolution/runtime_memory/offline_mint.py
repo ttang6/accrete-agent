@@ -1,8 +1,8 @@
 """ReflectorMintRunner — 离线飞轮 mint（批/调度，**非 inline 热路径**）。
 
 把 trace 里"非 schema、tool-grounded、且有可观测恢复"的失败，经 Reflector 产出
-grounded `suggested_action`，mint 成 CANDIDATE RuntimeLesson 入 backend——之后走
-现有 PromotionGate → LessonRetriever 召回消费。与 inline 模板 LessonIngestor 共用
+grounded `suggested_action`，mint 成 RuntimeLesson 入 backend——出生即 score=T 可被
+LessonRetriever 召回，之后凭 helped/hurt 账本涨落。与 inline 模板 LessonIngestor 共用
 同一 lesson_id 语义键（跨 trace / 跨 mint 路径自然去重 + evidence 累加）。
 
 两半分流（对齐 docs/_eval_flywheel_hole_workflow_findings.md §7）：
@@ -12,15 +12,14 @@ grounded `suggested_action`，mint 成 CANDIDATE RuntimeLesson 入 backend——
   consumption 闸是硬的（旁路 + flag + retriever 永不读此 jsonl），不靠 reflector 弃权。
 
 门控（只 mint 重执行身份明确的 op）：
-- 跳过 schema_mismatch（Tier-1 确定性 RepairGate 管）、coverage_gap / soft_quality（不绑 tool）。
-- 只收 `skill_exec:<skill>/<script>` 前缀的 op（episode tool_key 已是脚本级、身份明确）。
-  **排除 fetch**（多源 digest loop ~50% 归因混淆）**与 arxiv**（episode tool_key 为裸
+- 跳过 schema_mismatch（Tier-1 确定性 RepairGate 管）、soft_quality（不绑 tool）。
+- 只收 `skill_exec:<skill>/<script>` 前缀的 op（episode op 已是脚本级、身份明确）。
+  **排除 fetch**（多源 digest loop ~50% 归因混淆）**与 arxiv**（episode op 为裸
   `arxiv`、action 级身份未细分——留待后续给 episode_extractor 加细粒度键再开）。
 """
 
 from __future__ import annotations
 
-import datetime
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,7 +32,7 @@ from nanoagent.evolution.runtime_memory.backend import (
 )
 from nanoagent.evolution.runtime_memory.episode_extractor import EpisodeExtractor
 from nanoagent.evolution.runtime_memory.lesson_generator import (
-    _cause_signature,
+    _failure_reason,
     _deterministic_lesson_id,
     _now_iso,
 )
@@ -45,7 +44,6 @@ from nanoagent.evolution.runtime_memory.schema import (
     FailureEvent,
     LessonEvidence,
     LessonStats,
-    LessonStatus,
     LessonTrigger,
     RuntimeEpisode,
     RuntimeLesson,
@@ -57,8 +55,8 @@ from nanoagent.evolution.runtime_memory.trace_error_classifier import (
 _logger = get_logger("offline_mint")
 
 # FailureEvent.error_type：这些不归 Reflector 的离线 mint 管
-# （schema 走 Tier-1；coverage/soft 不绑 tool，tool_key 也为空）
-_SKIP_ERROR_TYPES = {"schema_mismatch", "coverage_gap", "soft_quality"}
+# （schema 走 Tier-1；soft 不绑 tool，op 也为空）
+_SKIP_ERROR_TYPES = {"schema_mismatch", "soft_quality"}
 _DEFAULT_ALLOWED_PREFIXES = ("skill_exec:",)
 
 
@@ -102,14 +100,12 @@ class ReflectorMintRunner:
         allowed_prefixes: Iterable[str] = _DEFAULT_ALLOWED_PREFIXES,
         soft_sink: Optional[SoftSuggestSink] = None,
         emit_soft: bool = False,
-        ttl_days: int = 14,
     ):
         self._backend = backend
         self._reflector = reflector
         self._allowed_prefixes = tuple(allowed_prefixes)
         self._soft_sink = soft_sink
         self._emit_soft = emit_soft
-        self._ttl_days = ttl_days
         self._extractor = EpisodeExtractor()
         self._classifier = TraceErrorClassifier()
 
@@ -144,10 +140,10 @@ class ReflectorMintRunner:
             _logger.warning(f"[offline_mint] add_episode 失败 {episode.episode_id}: {e}")
 
         for fe in episode.failures:
-            if not fe.tool_key or fe.error_type in _SKIP_ERROR_TYPES:
+            if not fe.op or fe.error_type in _SKIP_ERROR_TYPES:
                 report.skipped += 1
                 continue
-            if not any(fe.tool_key.startswith(p) for p in self._allowed_prefixes):
+            if not any(fe.op.startswith(p) for p in self._allowed_prefixes):
                 report.skipped += 1  # 排除 fetch / arxiv / 多源 loop
                 continue
             recovery = find_observed_recovery(events, fe)
@@ -169,8 +165,8 @@ class ReflectorMintRunner:
         if result is None or not result.suggested_action:
             report.abstained += 1
             return
-        error_class = self._classifier.classify(fe, episode.failures)
-        lesson = self._build_lesson(episode, fe, error_class, result)
+        failure_class = self._classifier.classify(fe, episode.failures)
+        lesson = self._build_lesson(episode, fe, failure_class, result)
         try:
             self._backend.add_lesson(lesson)
             report.grounded_minted += 1
@@ -192,20 +188,17 @@ class ReflectorMintRunner:
 
     def _build_lesson(
         self, episode: RuntimeEpisode, fe: FailureEvent,
-        error_class: str, result,
+        failure_class: str, result,
     ) -> RuntimeLesson:
-        cause_sig = _cause_signature(fe, error_class)
+        failure_reason = _failure_reason(fe, failure_class)
         lesson_id = _deterministic_lesson_id(
-            error_class=error_class, tool_key=fe.tool_key, cause_sig=cause_sig,
+            failure_class=failure_class, op=fe.op, failure_reason=failure_reason,
         )
         now = _now_iso()
-        expires_on = (
-            datetime.date.today() + datetime.timedelta(days=self._ttl_days)
-        ).isoformat()
         trigger = LessonTrigger(
-            error_class=error_class, tool_name=fe.tool_key,
+            failure_class=failure_class, op=fe.op,
             failure_count_gte=1, scope=f"agent:{episode.agent_name}",
-            cause_sig=cause_sig,
+            failure_reason=failure_reason,
         )
         evidence = LessonEvidence(
             source_episode_ids=[episode.episode_id],
@@ -224,8 +217,8 @@ class ReflectorMintRunner:
             advice=advice,
             trigger=trigger, evidence=evidence,
             source_type="reflector",
-            created_at=now, updated_at=now, expires_on=expires_on,
-            status=LessonStatus.CANDIDATE, stats=LessonStats(), ttl_days=self._ttl_days,
+            created_at=now, updated_at=now,
+            stats=LessonStats(),
             example=result.suggested_action,
         )
 
@@ -239,12 +232,11 @@ class ReflectorMintRunner:
             report.abstained += 1
             return
         self._soft_sink.write({
-            "status": LessonStatus.CANDIDATE.value,  # 钉 CANDIDATE，永不召回
-            "grounded": False,
+            "grounded": False,  # 软 suggest 物理旁路,永不进 backend / 召回
             "episode_id": episode.episode_id,
             "trace_path": episode.trace_path,
             "iteration": fe.iteration,
-            "tool_key": fe.tool_key,
+            "op": fe.op,
             "error_type": fe.error_type,
             "error_message": fe.error_message[:300],
             "diagnosis": result.diagnosis,

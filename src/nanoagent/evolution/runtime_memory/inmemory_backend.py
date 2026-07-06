@@ -17,7 +17,6 @@ from nanoagent.evolution.runtime_memory.backend import (
 )
 from nanoagent.evolution.runtime_memory.schema import (
     LessonStats,
-    LessonStatus,
     RuntimeEpisode,
     RuntimeLesson,
 )
@@ -143,23 +142,13 @@ class InMemoryMemoryBackend(MemoryBackend):
         self,
         lesson_id: str,
         *,
-        status: Optional[LessonStatus] = None,
         stats: Optional[LessonStats] = None,
-        expires_on: Optional[str] = None,
-        confidence: Optional[float] = None,
     ) -> RuntimeLesson:
-        # 状态机校验在 ABC 模板方法 update_lesson_metadata 已处理
         lesson = self._lessons.get(lesson_id)
         if lesson is None:
             raise LessonNotFound(f"lesson_id={lesson_id!r} not found")
-        if status is not None:
-            lesson.status = status
         if stats is not None:
             lesson.stats = stats
-        if expires_on is not None:
-            lesson.expires_on = expires_on
-        if confidence is not None:
-            lesson.confidence = confidence
         lesson.updated_at = _now_iso()
         # 返回拷贝
         return RuntimeLesson.from_dict(lesson.to_dict())
@@ -192,13 +181,6 @@ class InMemoryMemoryBackend(MemoryBackend):
             lesson.example = example
         lesson.updated_at = _now_iso()
         return RuntimeLesson.from_dict(lesson.to_dict())
-
-    def list_expired(self, today_iso: str) -> List[RuntimeLesson]:
-        return [
-            RuntimeLesson.from_dict(lesson.to_dict())
-            for lesson in self._lessons.values()
-            if lesson.expires_on < today_iso and lesson.status != LessonStatus.EXPIRED
-        ]
 
     def delete_lesson(self, lesson_id: str) -> bool:
         return self._lessons.pop(lesson_id, None) is not None

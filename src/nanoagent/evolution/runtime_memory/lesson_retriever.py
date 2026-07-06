@@ -4,16 +4,14 @@
 lesson 立刻可用——这样不必等到第二次失败 FailureMemory 才能 augment。
 
 设计取舍（减法）：
-- 只一个查询入口 `try_recall(tool_key, error_type)`——按精确 (tool, error_class)
+- 只一个查询入口 `try_recall(op, error_type)`——按精确 (tool, failure_class)
   匹配；不做语义检索 / 模糊匹配
-- **标签桥接**：FailureMemory 的 schema_mismatch/transient/unknown 三档标签
-  与 TraceErrorClassifier 的 5 类 error_class 不完全对齐——尤其
-  classifier 把"同参数失败 ≥2 次"升级为 `repeated_same_args_failure`。
-  retriever 内部用 `_LABEL_BRIDGE` 把 FailureMemory 标签 OR-展开到多个候选
-  error_class，避免真实 pipeline 产出的 lesson 召不回。
+- **桥已拆**（键重构·刀3·3c）:热路径 `error_type`（base-3:schema_mismatch/
+  transient/unknown）与入库的 `trigger.failure_class` 现在同一套标签,直接精确匹配、
+  不再 OR-展开。旧 `_LABEL_BRIDGE` 是"键含召回时算不出的信息"（repeated 要计数）
+  的补偿器,键收敛到首次可观测的 base-3 后自然失业。
 - 默认只取 status=PROMOTED 的 lesson；candidate 不算数（避免未验证经验污染）
-- TTL 过滤客户端做（filter grammar 没有 lt 运算符），跨 backend 行为一致
-- 多条 hit 取 confidence 最高的 1 条；其他丢弃
+- 多条 hit 取净有效次数（helped_count - hurt_count）最高的 1 条；其他丢弃
 - backend 异常吞掉返回 None（fail-open，不阻断 main loop）
 - format_hint 对 recommendation 做硬上限（300 char），防止长 lesson 绕过
   MainLoop 的 max_tool_output_chars 截断
@@ -21,14 +19,14 @@ lesson 立刻可用——这样不必等到第二次失败 FailureMemory 才能 
 
 from __future__ import annotations
 
-import datetime
 import json
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 from nanoagent.core.logger import get_logger
 from nanoagent.evolution.runtime_memory.backend import MemoryBackend
 from nanoagent.evolution.runtime_memory.lesson_generator import _condition_hint
-from nanoagent.evolution.runtime_memory.schema import LessonStatus, RuntimeLesson
+from nanoagent.evolution.runtime_memory.lesson_score import compute_score, is_active
+from nanoagent.evolution.runtime_memory.schema import RuntimeLesson
 from nanoagent.runtime.context_sources import (
     MARKER_LEARNED_EXAMPLE,
     MARKER_LEARNED_LESSON,
@@ -40,32 +38,6 @@ _logger = get_logger("lesson_retriever")
 # 防止 lesson 绕过 main_loop 的 max_tool_output_chars 截断膨胀 context。
 _HINT_MAX_RECOMMENDATION_CHARS = 300
 
-# 标签桥接表：FailureMemory 标签（_classify_tool_failure 输出）
-# → TraceErrorClassifier 的 error_class 候选集。
-# 用于 try_recall 的 OR-匹配，覆盖真实 pipeline 产出的 lesson。
-#
-# 桥接逻辑：
-# - schema_mismatch（FM）→ schema_mismatch + repeated_same_args_failure
-#   理由：classifier 在同参数 ≥2 次失败时把 schema_mismatch 升级为 repeated 类，
-#   但 FM 在第 1 次失败发生的瞬间分类只能是 schema_mismatch
-# - transient（FM）→ tool_runtime_error + repeated_same_args_failure
-#   理由：classifier 没有 transient 类；transient 错误归到
-#   tool_runtime_error；同参数重复 transient 也走 repeated 类
-# - unknown（FM）→ tool_runtime_error + repeated_same_args_failure
-#   理由：兜底匹配；任何 tool 错误的兜底也是 tool_runtime_error
-_LABEL_BRIDGE: Dict[str, Tuple[str, ...]] = {
-    "schema_mismatch": ("schema_mismatch", "repeated_same_args_failure"),
-    "transient": ("tool_runtime_error", "repeated_same_args_failure"),
-    "unknown": ("tool_runtime_error", "repeated_same_args_failure"),
-}
-
-
-def _expand_error_type(error_type: str) -> List[str]:
-    """把单个 FailureMemory 标签桥接成候选 error_class 列表。
-    未注册的标签按原样返回（不做误展开）。"""
-    bridged = _LABEL_BRIDGE.get(error_type)
-    return list(bridged) if bridged else [error_type]
-
 
 class LessonRetriever:
     """backend 上一层的薄包装。减法版只暴露一个方法。"""
@@ -74,46 +46,34 @@ class LessonRetriever:
         self._backend = backend
 
     def try_recall(
-        self, tool_key: str, error_type: str
+        self, op: str, error_type: str
     ) -> Optional[RuntimeLesson]:
-        """按 (tool_key, error_type) 找一条 promoted 且未过期的 lesson。
+        """按 (op, error_type) 找一条 promoted 且未过期的 lesson。
 
-        - tool_key：与 RuntimeLesson.trigger.tool_name 精确比对
+        - op：与 RuntimeLesson.trigger.op 精确比对
                     （e.g. "skill_exec:ai-digest/dup_check"）
-        - error_type：FailureMemory 标签（schema_mismatch/transient/unknown）；
-                    内部通过 `_LABEL_BRIDGE` OR-展开到多个候选 error_class，
-                    保证真实 pipeline 产出的 lesson（如 repeated_same_args_failure）
-                    在第 1 次失败时也能被召回。
+        - error_type：热路径 base 标签（schema_mismatch/transient/unknown）,与入库的
+                    `trigger.failure_class` 同一套标签,直接精确匹配（桥已拆,见模块 docstring）。
 
         Returns:
-            最佳匹配 lesson（按 confidence 降序取首条）；无匹配 / backend 异常 → None
+            最佳匹配 lesson（active 中按 score 降序取首条）；无匹配 / backend 异常 → None
         """
-        if not tool_key or not error_type:
+        if not op or not error_type:
             return None
 
-        # 标签桥接：把 FailureMemory 标签展开成候选 error_class 集合
-        candidate_classes = _expand_error_type(error_type)
-        # PROBATION 也参与召回（试用层），让试用 lesson 收到真实 helped/hurt
-        # stats，PromotionGate 才能据此决定升 PROMOTED 或回 CANDIDATE。
-        # confidence 排序时 PROMOTED 通常更高（已经被验证），自然优先。
+        # 刀4:注入闸从"status in {PROMOTED,PROBATION}"换成"score ≥ T"。按 (op,
+        # failure_class) 取全部候选（不再按 status 预切——status 已无存储态），
+        # 客户端算派生分、留 active（score≥T）、按 score 降序。候选集本就极小（同
+        # (op,class) 没几条,limit=20 兜底）,客户端过滤零成本。
         try:
             candidates = self._backend.search_lessons(
                 filters={
                     "AND": [
-                        {"status": {"in": [
-                            LessonStatus.PROMOTED.value,
-                            LessonStatus.PROBATION.value,
-                        ]}},
-                        {"trigger.tool_name": tool_key},
-                        {
-                            "OR": [
-                                {"trigger.error_class": ec}
-                                for ec in candidate_classes
-                            ]
-                        },
+                        {"trigger.op": op},
+                        {"trigger.failure_class": error_type},
                     ]
                 },
-                limit=20,  # 同 (tool, error_class) 一般没几条；20 安全上限
+                limit=20,
             )
         except Exception as e:
             _logger.warning(
@@ -121,31 +81,26 @@ class LessonRetriever:
             )
             return None
 
-        # 客户端 TTL 过滤（filter grammar 没 lt 运算符；保持行为跨 backend 一致）
-        today = datetime.date.today().isoformat()
-        fresh = [l for l in candidates if l.expires_on >= today]
-        if not fresh:
+        active = [l for l in candidates if is_active(l)]
+        if not active:
             return None
 
-        # 取 confidence 最高的；同分按 updated_at 新优先
-        fresh.sort(
-            key=lambda l: (l.confidence, l.updated_at),
-            reverse=True,
-        )
-        return fresh[0]
+        # score 已含净有效次数 + 次线性复活项；同分按 updated_at 新优先
+        active.sort(key=lambda l: (compute_score(l), l.updated_at), reverse=True)
+        return active[0]
 
     def format_hint(self, lesson: RuntimeLesson) -> str:
         """把 lesson 拼成可附加到 tool_result 末尾的 hint 字符串。
 
         格式：
-            [learned-lesson] {advice} (lesson_id=xxx, conf=0.75)
+            [learned-lesson] {advice} (lesson_id=xxx)
             [适用条件] {现渲染：适用于 X 的 Y 类失败（特征 Z）}     ← 基本恒有
             [learned-example]（示例标注） {json}     ← 可选
 
         advice 硬截断到 `_HINT_MAX_RECOMMENDATION_CHARS`（300 char），防止超长
         lesson 绕过 MainLoop 的 max_tool_output_chars 把 context 撑爆。
 
-        [适用条件] 行从 trigger 的 error_class+tool_name+cause_sig **现渲染**
+        [适用条件] 行从 trigger 的 failure_class+op+failure_reason **现渲染**
         （condition_hint 字段已删——它 100% 派生自这三个输入，不再存储）。
 
         lesson.example 非 None 时附加结构化修复块。示例来自历史失败现场，参数值
@@ -158,11 +113,11 @@ class LessonRetriever:
             rec = rec[:_HINT_MAX_RECOMMENDATION_CHARS] + "...(截断)"
         parts = [
             f"\n\n{MARKER_LEARNED_LESSON} {rec} "
-            f"(lesson_id={lesson.lesson_id}, conf={lesson.confidence:.2f})"
+            f"(lesson_id={lesson.lesson_id})"
         ]
         condition = _condition_hint(
-            lesson.trigger.tool_name, lesson.trigger.error_class,
-            lesson.trigger.cause_sig,
+            lesson.trigger.op, lesson.trigger.failure_class,
+            lesson.trigger.failure_reason,
         ).strip()
         if condition:
             parts.append(f"\n[适用条件] {condition[:200]}")

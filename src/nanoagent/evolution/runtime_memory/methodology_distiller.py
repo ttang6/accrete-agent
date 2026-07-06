@@ -10,8 +10,8 @@ skill 目录下一个固定文件名的旁挂文件——**绝不碰 SKILL.md �
 - 不进 user-turn 热路径——经 debug 通道手动触发（`python -m
   nanoagent.evolution.runtime_memory.methodology_distiller`），攒够才落。
 
-"够格"判定复用 PromotionGate 一侧的结论（lesson 已 PROMOTED）；写文件那步保持哑：
-只把够格 lesson 蒸出来复写整文件，不再自己判阈值，除了"每 skill 至少 N 条 promoted
+"够格"判定复用 lesson_score 的结论（lesson 已 active,即 score≥T）；写文件那步保持哑：
+只把够格 lesson 蒸出来复写整文件，不再自己判阈值，除了"每 skill 至少 N 条 active
 才值得落"这一个落盘下限（min_lessons）。
 
 带 1.2 那把刀喂副 LLM：只留"换个场景 / 换个用户也成立"的通用做法，丢弃一次性细节与
@@ -31,7 +31,8 @@ from typing import Dict, List, Optional
 from nanoagent.core.logger import get_logger
 from nanoagent.core.prompt_assets import load_prompt
 from nanoagent.evolution.runtime_memory.backend import MemoryBackend
-from nanoagent.evolution.runtime_memory.schema import LessonStatus, RuntimeLesson
+from nanoagent.evolution.runtime_memory.lesson_score import is_active
+from nanoagent.evolution.runtime_memory.schema import RuntimeLesson
 from nanoagent.runtime.subagent import SubAgentContextBuilder, SubAgentRunner
 
 _logger = get_logger("methodology_distiller")
@@ -69,18 +70,18 @@ class DistillOutcome:
 def _skill_of_lesson(lesson: RuntimeLesson) -> Optional[str]:
     """把一条 lesson 归属到某个 skill；归不到（通用工具如 fetch/glob 的 lesson）→ None。
 
-    优先读 trigger.scope 的正式键 `skill:<name>`；否则从 tool_name 的
-    `skill_exec:<skill>/<script>` 前缀解析（与 lesson_key 同源）。
+    优先读 trigger.scope 的正式键 `skill:<name>`；否则从 op 的
+    `skill_exec:<skill>/<script>` 前缀解析（与 op 同源）。
     """
     scope = (lesson.trigger.scope or "").strip()
     if scope.startswith("skill:"):
         name = scope[len("skill:"):].strip()
         if name:
             return name
-    tool_name = (lesson.trigger.tool_name or "").strip()
-    if tool_name.startswith("skill_exec:") and "/" in tool_name:
+    op = (lesson.trigger.op or "").strip()
+    if op.startswith("skill_exec:") and "/" in op:
         # skill_exec:<skill>/<script>
-        skill = tool_name[len("skill_exec:"):].split("/", 1)[0].strip()
+        skill = op[len("skill_exec:"):].split("/", 1)[0].strip()
         if skill:
             return skill
     return None
@@ -113,11 +114,11 @@ class MethodologyDistiller:
     # ------------------------------------------------------------------
 
     def collect_promoted_by_skill(self) -> Dict[str, List[RuntimeLesson]]:
-        """扫 backend 全部 PROMOTED lesson，按归属 skill 分组（归不到 skill 的丢弃）。"""
+        """扫 backend 全部 active（score≥T）lesson，按归属 skill 分组（归不到 skill 的丢弃）。"""
         out: Dict[str, List[RuntimeLesson]] = {}
-        lessons = self._backend.search_lessons(
-            filters={"status": LessonStatus.PROMOTED.value}, limit=1000
-        )
+        lessons = [
+            l for l in self._backend.search_lessons(limit=1000) if is_active(l)
+        ]
         for lesson in lessons:
             skill = _skill_of_lesson(lesson)
             if skill is None:
@@ -190,9 +191,9 @@ def _render_lessons(lessons: List[RuntimeLesson]) -> str:
     lines: List[str] = []
     for i, lesson in enumerate(lessons, 1):
         t = lesson.trigger
-        cond = f"error_class={t.error_class}"
-        if t.cause_sig:
-            cond += f", cause={t.cause_sig}"
+        cond = f"failure_class={t.failure_class}"
+        if t.failure_reason:
+            cond += f", cause={t.failure_reason}"
         lines.append(f"{i}. 【触发：{cond}】{lesson.advice}")
         if isinstance(lesson.example, dict) and lesson.example:
             lines.append(f"   结构化示例：{json.dumps(lesson.example, ensure_ascii=False)}")

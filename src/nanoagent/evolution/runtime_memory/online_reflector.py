@@ -1,7 +1,7 @@
 """OnlineReflector — 在线微反思：同 op 第 2 次失败时基于报错产一个修复假设。
 
 docs/81 §5.4 在线/离线铁律的修正案（增补，不替换确定性地板）：
-- 触发窄：同 op_key 第 2 次失败 + 飞轮无可召回的 suggested_action + 每 turn 上限
+- 触发窄：同 call_key 第 2 次失败 + 飞轮无可召回的 suggested_action + 每 turn 上限
 - 产出是假设不是经验——hint 标注语明示未验证，主 LLM 决定采纳与否，
   下一次工具调用即环境验证
 - fail-open：副 LLM 任何异常 → None，行为与未装配时完全一致
@@ -108,11 +108,11 @@ class OnlineReflector:
         )
 
     def try_suggest(
-        self, tool_key: str, raw_args: str, error_output: str
+        self, op: str, raw_args: str, error_output: str
     ) -> Optional[ReflectorSuggestion]:
         """对一次失败现场产一个修复假设。任何异常路径 → None（fail-open）。"""
         try:
-            return self._suggest_impl(tool_key, raw_args, error_output)
+            return self._suggest_impl(op, raw_args, error_output)
         except Exception as e:
             _logger.warning(
                 f"[online_reflector] suggest failed (fail-open): {type(e).__name__}: {e}"
@@ -120,10 +120,10 @@ class OnlineReflector:
             return None
 
     def _suggest_impl(
-        self, tool_key: str, raw_args: str, error_output: str
+        self, op: str, raw_args: str, error_output: str
     ) -> Optional[ReflectorSuggestion]:
         user_content = (
-            f"工具: {tool_key}\n"
+            f"工具: {op}\n"
             f"调用参数: {(raw_args or '')[:_MAX_RAW_ARGS_CHARS]}\n"
             f"报错原文:\n{(error_output or '')[:_MAX_ERROR_OUTPUT_CHARS]}"
         )
@@ -146,7 +146,7 @@ class OnlineReflector:
         if not isinstance(suggested, dict):
             suggested = None
         # 护栏：建议 args 与原 args 相同 → 丢弃建议只留诊断（同参重试正是
-        # repeated_same_args_failure 要防的，不能由反思自己诱发）
+        # same_args 熔断要防的，不能由反思自己诱发）
         if suggested is not None and suggested == _parse_raw_args(raw_args):
             suggested = None
         if not diagnosis and suggested is None:

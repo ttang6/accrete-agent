@@ -2,18 +2,18 @@
 
 输入：单 trace 的 events list（或 trace 文件路径）
 处理：扫 ACTION_LESSON_USED → look ahead 同 tool 后续事件 →
-      判 HELPED / HURT / INEFFECTIVE → 更新 backend stats + Beta confidence
+      判 HELPED / HURT / INEFFECTIVE → 更新 backend stats（helped/hurt/ineffective 计数）
 
 入门视角：
-- 飞轮闭环关键一环：lesson 用过之后没人更新它，confidence 永远是死的 0
+- 飞轮闭环关键一环：lesson 用过之后没人更新它，helped/hurt 计数永远是死的 0
 - 在每个 turn 完整结束（含 evaluator retry）后被 Harness 触发
-- 不主动状态机流转 candidate → promoted（那是 PromotionGate 的事）
+- 只写 helped/hurt 账本;注入资格由 lesson_score 从账本派生,无状态机流转
 
 tri-state 判定：
 - 对每条 ACTION_LESSON_USED 事件 E（按 lesson_id 去重，取首次）：
   1. 优先扫同 tool 后续 ACTION_TOOL_CALL_REPAIR_REQUIRED → INEFFECTIVE
      (lesson 已注入但 LLM 仍生成被 schema 拦截的同类非法调用 ——
-      "relevant but ineffective"，不进 helped/hurt 计数，不污染 confidence)
+      "relevant but ineffective"，不进 helped/hurt 计数)
   2. 否则扫 ACTION_TOOL_CALL_END：output 含失败签名 → HURT；全成功 → HELPED
 
 关键："后续"判定 = iteration **严格大于** lesson_used.iteration：
@@ -25,18 +25,12 @@ tri-state 判定：
   TCE 仍 idx 较大，仍会被误判 HURT
 - 只有"iteration 严格大于"两层语义都对：同 iter 全部排除（前因），下 iter 全部纳入（结果）
 
-confidence 公式（仅 HELPED/HURT 影响）：
-- 简单 Beta：`success / (success + failure + 1)`
-- 加 1 是 Laplace smoothing，防止 success=0 / failure=0 极端值
-
-INEFFECTIVE 副作用：
-- ineffective_count++（独立计数）
-- confidence 不变（success/failure 不动）
-- 若 lesson.status == PROMOTED → 自动降级 CANDIDATE
-  （PROBATION/RETIRED/CANDIDATE/EXPIRED 状态不动，只 stats 累加）
-- 自动降级理由：lesson 已无能力把 LLM 拉回合法调用 —— 文本表达失效。
-  未来版本可用阈值控制（如 ineffective_count >= 3 才降）；当前一击降级
-  保守一些防 false positive。
+账本更新（刀4 折叠）：
+- 判别仍产三态（INEFFECTIVE 从 REPAIR_REQUIRED trace 事件判出 —— 这是"被应用×有效"
+  的测量,保留;走 trace 不走 lesson 行）
+- 但**账本折叠**:HELPED → helped_count++;HURT / INEFFECTIVE 同权 → hurt_count++
+  （两者都是"注入后没起作用",分数权重 −1）。不留独立 ineffective 计数、不碰 status
+- 注入资格由 `lesson_score.compute_score` 从账本派生（score≥T），OutcomeTracker 不判晋降
 
 幂等：
 - _processed_paths set 防同一 trace 重复处理
@@ -48,7 +42,7 @@ INEFFECTIVE 副作用：
 - trace 文件读失败 → skip + log warning
 
 下游：
-- PromotionGate 用 confidence + hit_count 判 candidate → promoted
+- lesson_score.compute_score 用 helped/hurt 账本派生注入分（score≥T 才召回）
 """
 
 from __future__ import annotations
@@ -66,7 +60,7 @@ from nanoagent.evolution.runtime_memory.backend import (
     LessonNotFound,
     MemoryBackend,
 )
-from nanoagent.evolution.runtime_memory.schema import LessonStats, LessonStatus
+from nanoagent.evolution.runtime_memory.schema import LessonStats
 from nanoagent.runtime.failure_memory import _is_tool_failure
 
 _logger = logging.getLogger("nanoagent.outcome_tracker")
@@ -88,7 +82,6 @@ class OutcomeUpdate:
     """
     lesson_id: str
     outcome: TraceOutcome
-    new_confidence: float
     new_hit_count: int
 
     @property
@@ -98,18 +91,6 @@ class OutcomeUpdate:
 
 def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
-
-
-def _compute_confidence(success: int, failure: int) -> float:
-    """Beta + Laplace smoothing：success / (success + failure + 1)。
-
-    样本极小时（s=0, f=0）→ 0/1 = 0；
-    s=1, f=0 → 1/2 = 0.5；
-    s=10, f=0 → 10/11 ≈ 0.91；
-    s=10, f=10 → 10/21 ≈ 0.48；
-    分母 +1 是平滑项，避免极端 0/0 或 1.0 触发 PromotionGate 误升级。
-    """
-    return success / max(1, success + failure + 1)
 
 
 class OutcomeTracker:
@@ -247,10 +228,13 @@ class OutcomeTracker:
     def _update_backend(
         self, lesson_id: str, outcome: TraceOutcome
     ) -> Optional[OutcomeUpdate]:
-        """根据 outcome 三态更新 backend stats。fail-open。
+        """根据 outcome 更新 backend 账本。fail-open。
 
-        HELPED / HURT：success 或 failure 计数 + Beta confidence 重算
-        INEFFECTIVE：ineffective_count++，confidence 不变；PROMOTED 自动降级 CANDIDATE
+        刀4 折叠:HELPED → helped_count++;HURT / **INEFFECTIVE 同权** → hurt_count++
+        （两者语义都是"注入后没起作用",分数权重都 −1,不留独立计数、不改状态）。
+        注入资格由 lesson_score 从账本派生,OutcomeTracker 不再碰 status。
+        判别的"被应用×有效"测量走 trace 事件（REPAIR_REQUIRED 本就在 trace）,不靠
+        lesson 行区分——账本只服务注入决策。
         """
         try:
             old = self._backend.get_lesson(lesson_id)
@@ -261,36 +245,14 @@ class OutcomeTracker:
             _logger.debug(f"OutcomeTracker skip：lesson {lesson_id} 不存在（已 deleted？）")
             return None
 
-        if outcome == TraceOutcome.INEFFECTIVE:
-            new_stats = LessonStats(
-                hit_count=old.stats.hit_count + 1,
-                success_after_hit=old.stats.success_after_hit,
-                failure_after_hit=old.stats.failure_after_hit,
-                ineffective_count=old.stats.ineffective_count + 1,
-                last_hit_at=_now_iso(),
-            )
-            new_conf = old.confidence  # 不动
-            update_kwargs: dict = {"stats": new_stats, "confidence": new_conf}
-            # PROMOTED → CANDIDATE 自动降级；其他状态保持
-            if old.status == LessonStatus.PROMOTED:
-                update_kwargs["status"] = LessonStatus.CANDIDATE
-                _logger.info(
-                    f"OutcomeTracker INEFFECTIVE：lesson {lesson_id} "
-                    f"PROMOTED → CANDIDATE（ineffective_count={new_stats.ineffective_count}）"
-                )
-        else:
-            helped = outcome == TraceOutcome.HELPED
-            new_stats = LessonStats(
-                hit_count=old.stats.hit_count + 1,
-                success_after_hit=old.stats.success_after_hit + (1 if helped else 0),
-                failure_after_hit=old.stats.failure_after_hit + (0 if helped else 1),
-                ineffective_count=old.stats.ineffective_count,  # 保持
-                last_hit_at=_now_iso(),
-            )
-            new_conf = _compute_confidence(
-                new_stats.success_after_hit, new_stats.failure_after_hit
-            )
-            update_kwargs = {"stats": new_stats, "confidence": new_conf}
+        helped = outcome == TraceOutcome.HELPED
+        new_stats = LessonStats(
+            hit_count=old.stats.hit_count + 1,
+            helped_count=old.stats.helped_count + (1 if helped else 0),
+            hurt_count=old.stats.hurt_count + (0 if helped else 1),
+            last_hit_at=_now_iso(),
+        )
+        update_kwargs = {"stats": new_stats}
 
         try:
             self._backend.update_lesson_metadata(lesson_id, **update_kwargs)
@@ -303,6 +265,5 @@ class OutcomeTracker:
         return OutcomeUpdate(
             lesson_id=lesson_id,
             outcome=outcome,
-            new_confidence=new_conf,
             new_hit_count=new_stats.hit_count,
         )

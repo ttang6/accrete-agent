@@ -10,10 +10,9 @@ tool_call_start/end 的 args；用 `runtime/tool_failure` SSoT 的失败签名
 
 failure 来源：
 1. tool_call_end 且 output 命中 `_FAILURE_SIGNATURES` → tool 调用失败
-2. coverage_hint_injected → 硬覆盖不达标，error_type="coverage_gap"
-3. evaluator_call_end 且 recommended_action != "finalize"（或 coverage_ok=False 或
+2. evaluator_call_end 且 recommended_action != "finalize"（或 coverage_ok=False 或
    soft_issues 非空）→ 副 LLM 判失败，error_type="soft_quality"
-4. failure_recovery_hint：本身不算独立 failure，把 hint 信息附到最近同
+3. failure_recovery_hint：本身不算独立 failure，把 hint 信息附到最近同
    iteration 的 tool failure 的 extras["recovery_hint"]
 """
 
@@ -26,8 +25,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from nanoagent.core.logger import get_logger
 from nanoagent.core.trace_schema import (
-    ACTION_COVERAGE_CHECK,
-    ACTION_COVERAGE_HINT_INJECTED,
     ACTION_EVALUATOR_CALL_END,
     ACTION_FAILURE_RECOVERY_HINT,
     ACTION_TOOL_CALL_END,
@@ -56,7 +53,7 @@ _logger = get_logger("episode_extractor")
 
 
 def _build_tool_key(tool: str, raw_args: str) -> str:
-    """构造 (tool_name, args) → tool_key。
+    """构造 (tool_name, args) → op。
 
     skill_exec 特殊：含 skill / script 拼到 key 前缀，便于跨 trace 关联同一 script。
     其他 tool 直接用 tool 名。
@@ -104,18 +101,17 @@ class EpisodeExtractor:
         body = events[body_start:body_end]
 
         failures: List[FailureEvent] = []
-        coverage_hits: List[Dict[str, Any]] = []
         evaluator_verdicts: List[Dict[str, Any]] = []
 
         # iteration -> 最近一次 tool_call_start，用于配对 tool_call_end 拿 args
         last_call_by_iter: Dict[Tuple[int, str], Dict[str, Any]] = {}
         # (iteration, tool) -> ACTION_TOOL_CALL_REPAIR_REQUIRED 事件原文
-        # （main_loop _apply_repair_gate 已抽好 repair_example / required_fields）。
+        # （main_loop _after_tool_repair_gate 已抽好 repair_example / required_fields）。
         # tool_call_end 的 output 含同源信息，但截断/格式漂移会破坏文本重解析；
         # 从专用 trace 事件直接读 dict 最稳。
         repair_event_by_iter: Dict[Tuple[int, str], Dict[str, Any]] = {}
         # 运行期修复配对材料：tool 失败的 (出现序号, FailureEvent) + 成功调用的
-        # (出现序号, tool, raw_input)。失败之后同 tool_key 换参成功 = 观测到的修复。
+        # (出现序号, tool, raw_input)。失败之后同 op 换参成功 = 观测到的修复。
         tool_fail_seq: List[Tuple[int, FailureEvent]] = []
         success_seq: List[Tuple[int, str, str]] = []
         seq = 0
@@ -153,14 +149,6 @@ class EpisodeExtractor:
                     )
                 continue
 
-            if action == ACTION_COVERAGE_CHECK:
-                coverage_hits.append(dict(ev))
-                continue
-
-            if action == ACTION_COVERAGE_HINT_INJECTED:
-                failures.append(_build_coverage_failure(ev))
-                continue
-
             if action == ACTION_FAILURE_RECOVERY_HINT:
                 _attach_recovery_hint(failures, ev)
                 continue
@@ -187,7 +175,6 @@ class EpisodeExtractor:
             stop_reason=_extract_stop_reason(body),
             total_steps=int(summary.get("total_steps", len(body))),
             failures=failures,
-            coverage_hits=coverage_hits,
             evaluator_verdicts=evaluator_verdicts,
             raw_summary=dict(summary),
         )
@@ -218,7 +205,7 @@ def _attach_runtime_repairs(
     tool_fail_seq: List[Tuple[int, FailureEvent]],
     success_seq: List[Tuple[int, str, str]],
 ) -> None:
-    """运行期修复配对：失败之后同 tool_key 换参成功 → 成功调用入 repair_example。
+    """运行期修复配对：失败之后同 op 换参成功 → 成功调用入 repair_example。
 
     E-v2 校验期 repair_example（RepairGate 事件）向运行期的推广——修复样例的来源
     从"schema 校验后的合法重调"扩展到"任意失败后被观测到的成功恢复"。谁促成的
@@ -249,7 +236,7 @@ def _attach_runtime_repairs(
         if isinstance(fe.extras, dict) and fe.extras.get("repair_example"):
             continue  # 校验期来源优先
         for s_seq, s_key, s_hash, s_args in parsed_successes:
-            if s_seq > f_seq and s_key == fe.tool_key and s_hash != fe.args_hash:
+            if s_seq > f_seq and s_key == fe.op and s_hash != fe.args_hash:
                 if fe.extras is None:
                     fe.extras = {}
                 fe.extras["repair_example"] = s_args
@@ -273,12 +260,12 @@ def _build_tool_failure(
         if start_ev:
             raw_args = start_ev.get("input", "") or ""
     output = end_ev.get("output", "") or ""
-    # F1：tool_key 优先读节点携带的 lesson_key（main_loop._emit_tool_op_node 写，
+    # F1：op 优先读节点携带的 op（main_loop._after_tool_record_to_trace 写，
     # 与热路径召回键同一来源）；旧 trace 无此字段时回退 _build_tool_key（legacy 投影）。
-    tool_key = end_ev.get("lesson_key") or _build_tool_key(tool, raw_args)
+    op = end_ev.get("op") or _build_tool_key(tool, raw_args)
     extras: Dict[str, Any] = {"raw_input": raw_args[:200]}
     # 结构化 repair_example / required_fields 经 extras 流到 LessonGenerator，
-    # 在那里落进 RuntimeLesson.example（content 层）+ cause_sig
+    # 在那里落进 RuntimeLesson.example（content 层）+ failure_reason
     if repair_event_by_iter is not None:
         repair_ev = repair_event_by_iter.get((iteration, tool))
         if isinstance(repair_ev, dict):
@@ -297,7 +284,7 @@ def _build_tool_failure(
         extras["semantic_failures"] = sf
     return FailureEvent(
         iteration=iteration,
-        tool_key=tool_key,
+        op=op,
         args_hash=_canonical_args_hash(raw_args),
         error_type=_classify_tool_error(output),
         error_message=output[:300],
@@ -314,8 +301,8 @@ def _extract_semantic_failures(output_text: str) -> List[Dict[str, Any]]:
     软失败（质量/语义问题）。前缀可能有 `[error] ...` 行让 _is_tool_failure
     命中；JSON 体从第一个 `{` 开始。无 JSON / 解析失败 / 字段缺失 → 返回空 list。
 
-    framework 仅做 pass-through——不识别 failure_type 的具体值，由 LessonGenerator
-    决定如何按 type 模板化（保 framework 不知 skill 知识的边界）。
+    framework 仅做 pass-through——不识别 failure_type 的具体值,只把 semantic_failures
+    抽进 extras 供下游（离线 methodology / _failure_reason）消费,不绑 skill 知识。
     """
     if not output_text:
         return []
@@ -333,22 +320,6 @@ def _extract_semantic_failures(output_text: str) -> List[Dict[str, Any]]:
         return []
     # 只保留 dict 元素 + 截前 20 条防 trace 膨胀（lesson 也不需要无限细粒度）
     return [item for item in sf if isinstance(item, dict)][:20]
-
-
-def _build_coverage_failure(ev: Dict[str, Any]) -> FailureEvent:
-    missing = ev.get("missing", [])
-    counts = ev.get("counts", {})
-    msg = f"coverage missing categories={missing} counts={counts}"
-    return FailureEvent(
-        iteration=ev.get("iteration", -1),
-        tool_key="",
-        args_hash="",
-        error_type="coverage_gap",
-        error_message=msg[:300],
-        timestamp=ev.get("timestamp", ""),
-        raw_action=ACTION_COVERAGE_HINT_INJECTED,
-        extras={"missing": list(missing), "counts": dict(counts)},
-    )
 
 
 def _evaluator_failed(ev: Dict[str, Any]) -> bool:
@@ -372,7 +343,7 @@ def _build_evaluator_failure(ev: Dict[str, Any]) -> FailureEvent:
     )
     return FailureEvent(
         iteration=ev.get("attempt", -1),  # evaluator 用 attempt 字段
-        tool_key="",
+        op="",
         args_hash="",
         error_type="soft_quality",
         error_message=msg[:300],
@@ -384,7 +355,7 @@ def _build_evaluator_failure(ev: Dict[str, Any]) -> FailureEvent:
             "soft_issues": list(ev.get("soft_issues", [])),
             "fail_open": ev.get("fail_open"),
             "coverage_ok": ev.get("coverage_ok"),
-            "reason": reason,  # 给 LessonGenerator soft_quality_issue 模板用
+            "reason": reason,  # soft_quality 离线 methodology / _failure_reason 用
         },
     )
 
