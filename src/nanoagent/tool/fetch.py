@@ -178,7 +178,7 @@ class FetchTool(BaseTool):
     def name(self) -> str:
         return "fetch"
 
-    def op_key(self, kwargs: dict) -> str:
+    def call_key(self, kwargs: dict) -> str:
         """fetch 的 op 投影 = 具体 URL（工具自声明，非框架按 host 猜）。
 
         熔断/计数粒度到单个失败 URL：同一 turn 内反复抓同一个挂掉的 URL 才累加，
@@ -187,7 +187,7 @@ class FetchTool(BaseTool):
         url = str((kwargs or {}).get("url", "") or "").strip()
         return f"fetch:{url}" if url else "fetch"
 
-    def lesson_key(self, kwargs: dict) -> str:
+    def op(self, kwargs: dict) -> str:
         """lesson 粗键 = 裸 'fetch'：抓取失败的修复经验（换 UA / 换抽取模式等）跨 URL 通用，
         不按 URL/host 细分。"""
         return "fetch"
@@ -212,7 +212,7 @@ class FetchTool(BaseTool):
         if m:
             retry_after = float(m.group(1))
         return ToolFailure(
-            op_key=self.op_key(kwargs), klass=klass,
+            call_key=self.call_key(kwargs), klass=klass,
             is_mutating=False, retry_after=retry_after,
         )
 

@@ -1,12 +1,12 @@
 import hashlib
 import json
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Literal, Optional
 
 
 def _args_hash(kwargs: dict) -> str:
-    """对 kwargs 做稳定 hash（sorted-json sha256 前 12 位），用于 op_key 默认投影。"""
+    """对 kwargs 做稳定 hash（sorted-json sha256 前 12 位），用于 call_key 默认投影。"""
     try:
         canonical = json.dumps(
             kwargs, sort_keys=True, ensure_ascii=False, separators=(",", ":")
@@ -27,15 +27,29 @@ FailureKlass = Literal["transient", "permanent"]
 class ToolFailure:
     """工具对一次失败的结构化自述。熔断器 / FailureMemory 读字段，不猜字符串。
 
-    op_key：per-op 计数 / 熔断键（见 BaseTool.op_key）。
+    call_key：per-op 计数 / 熔断键（见 BaseTool.call_key）。
     klass：policy 信号（transient/permanent/None）。
     is_mutating：不可逆写 → 熔断器 fail-fast（N=1，不自动重试）。
     retry_after：服务器建议的重试等待秒数（429/503 的 Retry-After），无则 None。
     """
-    op_key: str
+    call_key: str
     klass: Optional[FailureKlass] = None
     is_mutating: bool = False
     retry_after: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class ValidationOutcome:
+    """`check_args` 富钩子的校验失败结果。中性位置（BaseTool 概念，不绑任何 skill）。
+
+    `repair_text` 必填——下游（MainLoop / FailureMemory / OutcomeTracker）靠它的固定
+    前缀识别为协议级失败。其余字段是可选的结构化修复信息，一般工具只给 repair_text 即可。
+    """
+    repair_text: str
+    error_message: str = ""
+    required_fields: list = field(default_factory=list)
+    allowed_values: dict = field(default_factory=dict)
+    repair_example: Optional[dict] = None
 
 
 class BaseTool(ABC):
@@ -59,40 +73,45 @@ class BaseTool(ABC):
     # 写/有副作用工具标记：不应被确定性自动重试（避免重复副作用）。默认 False。
     is_mutating: bool = False
 
-    def op_key(self, kwargs: dict) -> str:
-        """失败计数 / 熔断的 operation key —— 工具自声明的 args 投影。
+    def op(self, kwargs: dict) -> str:
+        """**操作身份**（粗粒度）——工具自声明,全系统唯一共享的基座概念。
 
-        默认：`tool_name:<全 args 的 hash>`（不同 args 集 = 不同 op）。子类覆盖以
-        声明更合适的粒度（fetch→url、arxiv→action、skill_exec→skill/script:args）。
-        FailureMemory 的 per-op 计数与（后续）熔断器都用它做键 —— 键由工具拥有、
-        不由框架按 tool_name 猜粒度。kwargs 是本次调用解析后的参数 dict。
-        """
-        return f"{self.name}:{_args_hash(kwargs or {})}"
-
-    def lesson_key(self, kwargs: dict) -> str:
-        """跨 trace lesson 存储 / 召回的**粗键**（意图级，不含 args-hash）——工具自声明。
-
-        F1 单一携带源（v3 阶段四-4b）：emit 时写进操作节点，热路径召回
-        （FailureMemory）与冷路径 episode 存储（EpisodeExtractor）都读这把携带键，
-        不再 `_operation_key.recall_key` / `episode_extractor._build_tool_key` 两处各算
-        一遍靠手工对齐（历史 drift 风险点）。默认 = tool_name；子类覆盖给更合适的粒度。
-
-        与 op_key 分工：op_key 细（含 args-hash，服务熔断/计数，一组 args 一个 op）；
-        lesson_key 粗（一类操作一条 lesson）。**绝不拿 op_key 当 lesson 键**（太细配不上）。
+        「哪个操作」,层级结构一个字段,不含 args 指纹。默认 = tool_name;子类覆盖给
+        更合适的粒度（fetch→'fetch'、arxiv→'arxiv'、skill_exec→'skill_exec:skill/script'）。
+        消费者:lesson 存储/召回键直接用 op;Reflector 观测恢复谓词 = op 相等 ∧ args_hash 不等。
+        F1 单一携带源:emit 写进操作节点,热路径召回（FailureMemory）与冷路径 episode 存储
+        （EpisodeExtractor）都读这把键,不再两处各算一遍靠手工对齐。
         """
         return self.name
+
+    def args_hash(self, kwargs: dict) -> str:
+        """**参数指纹**——本次调用参数的稳定 hash。op 的正交轴。
+
+        默认 = 全 kwargs 的 canonical sha256[:12]。子类极少覆盖（op 已声明了粒度,
+        args_hash 只回答"同一操作下哪组参数"）。
+        """
+        return _args_hash(kwargs or {})
+
+    def call_key(self, kwargs: dict) -> str:
+        """**细粒度调用键 = (op, args_hash) 派生物**——服务失败计数 / 熔断。
+
+        默认 = `f"{op}:{args_hash}"`。同 op 同 args = 同 call_key（一次具体调用）。
+        子类可覆盖给更可读的表示（如 fetch 直接嵌 URL 便于熔断消息可读),但语义仍是
+        「同一操作的同一组参数」。**lesson 召回键用 op 不用 call_key**（后者太细配不上一类操作）。
+        """
+        return f"{self.op(kwargs)}:{self.args_hash(kwargs)}"
 
     def classify_failure(
         self, kwargs: dict, output: str, exc: Optional[BaseException] = None
     ) -> ToolFailure:
-        """失败时返回结构化 ToolFailure（op_key + klass + is_mutating + retry_after）。
+        """失败时返回结构化 ToolFailure（call_key + klass + is_mutating + retry_after）。
 
         默认 klass=None（best-effort：工具说不清 → 交给 LLM / 退化）。能从 typed
         信号判定 klass 的工具（如 fetch 从 requests.exceptions.*）覆盖本方法给出
         硬 klass。只在 result 已判定为失败时调用。
         """
         return ToolFailure(
-            op_key=self.op_key(kwargs), klass=None, is_mutating=self.is_mutating
+            call_key=self.call_key(kwargs), klass=None, is_mutating=self.is_mutating
         )
 
     @property
@@ -106,10 +125,23 @@ class BaseTool(ABC):
     def validate(self, **kwargs) -> Optional[str]:
         return None
 
+    def check_args(self, **kwargs) -> Optional[ValidationOutcome]:
+        """运行期富钩子：validate 之后、_execute 之前的一次结构化 arg 校验。
+
+        默认返 None（不拦）。有声明式 schema 的工具（如 SkillExecTool）override 它——
+        校验失败返 ValidationOutcome，run() 直接把 repair_text 当 tool_result 返回、不进
+        _execute。与 strict_mode 正交：strict 是解码期 provider 拦，check_args 是运行期拦。
+        向后兼容：默认 None → 现有工具零迁移（validate 签名不变）。
+        """
+        return None
+
     def run(self, **kwargs) -> str:
         error = self.validate(**kwargs)
         if error:
             return f"[参数错误] {error}"
+        outcome = self.check_args(**kwargs)
+        if outcome is not None:
+            return outcome.repair_text
         try:
             return self._execute(**kwargs)
         except Exception as e:

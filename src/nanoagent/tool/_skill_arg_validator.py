@@ -19,7 +19,7 @@
       2. FailureMemory `_FAILURE_SIGNATURES` 含此前缀 → 走 lesson 召回 / 重复失败
          / 3rd 次 stop_condition 的现有保护链
       3. OutcomeTracker 看到 lesson_used + 同 tool 后续 repair_required
-         → 判 ineffective_application（不污染 helped/hurt confidence）
+         → 判 ineffective_application（不污染 helped/hurt 计数）
 
 依赖：
   jsonschema（项目 requirements；transitive via mcp，pyproject 已显式声明）。
@@ -28,7 +28,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -36,6 +35,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError, best_match
 
 from nanoagent.runtime.context_sources import MARKER_GATE_INVALID_CALL
+from nanoagent.tool.base import ValidationOutcome
 
 
 # repair 输出固定前缀 = gate 命名空间的 invalid-call marker。字面量单一来源在
@@ -94,18 +94,9 @@ def load_skill_script_schema(
 # ============================================================
 
 
-@dataclass(frozen=True)
-class ValidationOutcome:
-    """schema 校验失败的结构化结果。"""
-    error_message: str  # jsonschema best_match 文本
-    required_fields: list[str]  # 缺失的 required 字段路径（如 "args.action"）
-    allowed_values: dict[str, list[Any]]  # enum 字段 → 候选值
-    repair_text: str  # 给 LLM 看的多行字符串，已含 prefix
-    # 结构化修复示例，与 repair_text 里渲染的 repair_example 单行同源；形如
-    # {"skill": ..., "script": ..., "args": {...}}，schema 无 examples 时为 None。
-    # 它沿飞轮 trace → episode → lesson.example 一路携带完整 dict，因此不会被
-    # error_message[:120] 截断；下次召回时 LessonRetriever 据它渲染 [learned-example] 块。
-    repair_example: Optional[dict] = None
+# ValidationOutcome 已挪到中性位置 `nanoagent.tool.base`（check_args 富钩子的返回类型，
+# 不再绑 skill 校验）。这里只构造它。结构化 repair_example 沿飞轮 trace → episode →
+# lesson.example 一路携带完整 dict，下次召回 LessonRetriever 据它渲染 [learned-example] 块。
 
 
 def _extract_parameters(schema: dict) -> dict:
@@ -184,7 +175,7 @@ def _format_repair_text(
             + json.dumps(allowed_values, ensure_ascii=False)
         )
     if example_args is not None:
-        # 单行 canonical JSON，下游 main_loop._apply_repair_gate 与 validation_error /
+        # 单行 canonical JSON，下游 main_loop._after_tool_repair_gate 与 validation_error /
         # required_fields 同样按行前缀解析（取代旧的多行 example_call 块 + DOTALL 正则
         # 往返）。结构化对象单一来源即此处，渲染与解析读同一份 dict。
         lines.append(

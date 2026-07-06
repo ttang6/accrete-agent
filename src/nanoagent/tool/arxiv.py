@@ -60,7 +60,7 @@ class ArxivTool(BaseTool):
     def name(self) -> str:
         return "arxiv"
 
-    def op_key(self, kwargs: dict) -> str:
+    def call_key(self, kwargs: dict) -> str:
         """arxiv 的 op 投影 = action(+query)（工具自声明）。
 
         修掉"8 个 action 全挤进一个 arxiv 桶"的塌缩：每个 action 独立计数；

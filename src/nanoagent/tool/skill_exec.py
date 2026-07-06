@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from nanoagent.tool.base import BaseTool
+from nanoagent.tool.base import BaseTool, ValidationOutcome
 from nanoagent.tool._skill_arg_validator import (
     load_skill_script_schema,
     validate_skill_args,
@@ -60,7 +60,7 @@ class SkillExecTool(BaseTool):
     def name(self) -> str:
         return "skill_exec"
 
-    def op_key(self, kwargs: dict) -> str:
+    def call_key(self, kwargs: dict) -> str:
         """skill_exec 的 op 投影 = skill/script:args-hash（工具自声明）。
 
         熔断/计数粒度到"具体脚本 + 具体 args"：同一 turn 内反复以同一组 args 调同
@@ -76,9 +76,9 @@ class SkillExecTool(BaseTool):
         h = _args_hash(inner if isinstance(inner, dict) else {})
         return f"skill_exec:{skill}/{script}:{h}"
 
-    def lesson_key(self, kwargs: dict) -> str:
+    def op(self, kwargs: dict) -> str:
         """lesson 粗键 = skill/script（不含 args-hash）——同一脚本的各种失败归一条 lesson。
-        与 op_key 同前缀、去掉 args-hash 尾巴。"""
+        与 call_key 同前缀、去掉 args-hash 尾巴。"""
         d = kwargs or {}
         skill = str(d.get("skill", "") or "?").strip() or "?"
         script = str(d.get("script", "") or "?").strip() or "?"
@@ -136,6 +136,24 @@ class SkillExecTool(BaseTool):
             return "script 参数不能为空"
         return None
 
+    def check_args(self, **kwargs) -> Optional[ValidationOutcome]:
+        """ToolCallRepairGate：subprocess 前对 args 做 jsonschema 校验（从 _execute 搬来）。
+
+        fail-open：schema 不存在 / args 非 dict → None（照常走 _execute → subprocess）。
+        校验失败 → ValidationOutcome，run() 直接把 repair_text（以 [gate-invalid-call]
+        开头）当 tool_result 返回：MainLoop 检测前缀 emit ACTION_TOOL_CALL_REPAIR_REQUIRED，
+        FailureMemory 把它当 failure 走 lesson 召回 / 重复失败保护链。飞轮契约零改动。
+        """
+        skill = (kwargs.get("skill") or "").strip()
+        script = (kwargs.get("script") or "").strip()
+        args = kwargs.get("args") or {}
+        if not skill or not script or not isinstance(args, dict):
+            return None
+        schema = load_skill_script_schema(self._skills_dir, skill, script)
+        if schema is None:
+            return None
+        return validate_skill_args(schema, skill, script, args)
+
     def _execute(self, **kwargs) -> str:
         skill = kwargs["skill"].strip()
         script = kwargs["script"].strip()
@@ -150,16 +168,7 @@ class SkillExecTool(BaseTool):
                 f"skills/{skill}/scripts/{script}.py"
             )
 
-        # ToolCallRepairGate：subprocess 前 jsonschema 校验。
-        # fail-open：schema 不存在 → schema 为 None → 跳过校验照常 subprocess。
-        # 校验失败 → 返回 repair_text（以 [gate-invalid-call] 开头），
-        # MainLoop 检测前缀 emit ACTION_TOOL_CALL_REPAIR_REQUIRED trace 事件，
-        # FailureMemory 也把它当 failure 走 lesson 召回 / 重复失败保护链。
-        schema = load_skill_script_schema(self._skills_dir, skill, script)
-        if schema is not None:
-            outcome = validate_skill_args(schema, skill, script, args)
-            if outcome is not None:
-                return outcome.repair_text
+        # arg 校验（RepairGate）已上移到 check_args，在 run() 里 _execute 之前跑。
 
         try:
             result = subprocess.run(

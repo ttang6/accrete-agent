@@ -44,7 +44,6 @@ import yaml
 
 from nanoagent.core.logger import get_logger
 from nanoagent.skills.base import Skill
-from nanoagent.skills.contract import SkillContract, load_skill_contract
 
 _logger = get_logger("skills.loader")
 
@@ -100,9 +99,6 @@ class SkillLoader:
         self._skills_dir.mkdir(parents=True, exist_ok=True)
         self._metadata_cache: dict[str, dict] = {}
         self._skills_cache: dict[str, Skill] = {}
-        # SkillContract 在首次 get_contract 时 lazy 加载（启动开销仅扫 metadata）。
-        # value=None 表示已查过且文件不存在，不重复尝试加载。
-        self._contract_cache: dict[str, Optional[SkillContract]] = {}
         self._scan_metadata()
 
     # ============================================================
@@ -215,22 +211,6 @@ class SkillLoader:
             for name, meta in self._metadata_cache.items()
         )
 
-    def get_contract(self, name: str) -> Optional[SkillContract]:
-        """按需 lazy 加载 skill 的 runtime contract（skill.yaml）。
-
-        无 skill.yaml 文件 → 返回 None（向后兼容：未声明 contract 的 skill
-        行为不变）。文件解析失败 → 也返回 None（contract 模块内部 log warning）。
-        """
-        if name in self._contract_cache:
-            return self._contract_cache[name]
-        meta = self._metadata_cache.get(name)
-        if meta is None:
-            self._contract_cache[name] = None
-            return None
-        contract = load_skill_contract(meta["dir"])
-        self._contract_cache[name] = contract
-        return contract
-
     # ============================================================
     # user_overrides.json 加载
     # ============================================================
@@ -313,5 +293,4 @@ class SkillLoader:
         """清空缓存并重新扫描。开发期热重载用。"""
         self._metadata_cache.clear()
         self._skills_cache.clear()
-        self._contract_cache.clear()
         self._scan_metadata()
