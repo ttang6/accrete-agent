@@ -1,10 +1,10 @@
 # Accrete Agent
 
-`accrete` 是一个基于 native function calling 的 agent 系统，关注任务的运行可靠性：长任务或自主态下，多数失败不再以报错的形式出现，也难以靠重试等常规手段覆盖。框架为此在 harness 层内建确定性防护与经验学习机制，把失败运行沉淀为后续可复用的经验，并配套结构化 trace 与确定性评测，验证这些机制的实际效果。
+`accrete` 是一个基于 native function calling 的 agent runtime，核心关注运行期的经验沉淀：agent 在真实运行中犯过的错，被提炼成结构化、可检索的经验记忆（lesson），由后续运行效果持续校准； skill 的使用方式也可以从任务轨迹反馈中优化。可靠性上，框架的取向是把能确定处理的问题确定地处理掉，对可观察的失败做检测、纠偏与经验复用，并用受控实验标明这套机制的适用边界。
 
 ## 特性
 
-`accrete` 当前聚焦单 agent 主循环和运行可靠性，不是多 agent 编排框架。核心能力包括：
+`accrete` 当前聚焦单 agent 主循环与运行期经验沉淀，不是多 agent 编排框架。核心能力包括：
 
 - **Native function-calling agent loop**：基于模型原生 tool call 的循环，由模型持续决策下一步动作，runtime 负责执行、观察、上下文管理和收束。
 - **统一工具抽象**：tool、skill、MCP、SubAgent 都作为可声明、可调用、可观测的 action 接入主循环。
