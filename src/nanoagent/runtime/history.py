@@ -72,6 +72,30 @@ class HistoryManager:
         self.messages.clear()
         self.updated_at = datetime.now()
 
+    def rewind_turns(self, n: int) -> int:
+        """回退最近 n 轮：从倒数第 n 条 user 消息起（含）截断到末尾。
+
+        一轮 = 一条 user 打头的对话段。按 user 消息定界（而非死板 user+assistant 配对），
+        对被打断/半截的历史也稳。截断是不可逆的活跃层动作；调用方若要留档，应在调用前
+        自行归档。
+
+        Args:
+            n: 回退几轮。
+
+        Returns:
+            真正回退的轮数（不足 n 轮时按现有轮数封顶；无 user 消息则 0）。
+        """
+        if n <= 0:
+            return 0
+        user_idxs = [i for i, m in enumerate(self.messages) if m.get("role") == "user"]
+        if not user_idxs:
+            return 0
+        n = min(n, len(user_idxs))
+        cut = user_idxs[-n]
+        self.messages = self.messages[:cut]
+        self.updated_at = datetime.now()
+        return n
+
     # ---------- 序列化（给 SessionStore 用）----------
 
     def to_dict(self) -> dict:

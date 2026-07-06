@@ -112,6 +112,27 @@ class SessionStore:
         self._save(key)
         return sess
 
+    def rewind_turns(self, key: str, n: int) -> int:
+        """回退某 session 最近 n 轮（活跃层截断）并落盘。返回真正回退的轮数。
+
+        rewind 归档（把废弃分支存成 fork 副本）不在这里做——由调用方（Harness）在调用
+        本方法前先 save_snapshot，保证归档的是截断前的完整历史。
+
+        Args:
+            key: session_key。
+            n: 回退几轮。
+
+        Returns:
+            真正回退的轮数；session 不存在或无可退时 0。
+        """
+        sess = self._sessions.get(key)
+        if sess is None:
+            return 0
+        removed = sess.rewind_turns(n)
+        if removed:
+            self._save(key)
+        return removed
+
     def list_sessions(self) -> list[dict]:
         """列所有已 hydrate 的 session（不含 snapshots）。
 
