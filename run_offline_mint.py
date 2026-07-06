@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 from typing import List
 
-from nanoagent.evolution.runtime_memory.sqlite_backend import (
+from accrete.evolution.runtime_memory.sqlite_backend import (
     DEFAULT_DB_PATH as LESSONS_DB_PATH,
     SqliteMemoryBackend,
 )
@@ -59,12 +59,12 @@ def main() -> int:
     except ImportError:
         pass
 
-    from nanoagent.core.llm_client import LLMClient
-    from nanoagent.evolution.runtime_memory.offline_mint import (
+    from accrete.core.llm_client import LLMClient
+    from accrete.evolution.runtime_memory.offline_mint import (
         ReflectorMintRunner,
         SoftSuggestSink,
     )
-    from nanoagent.evolution.runtime_memory.reflector import Reflector
+    from accrete.evolution.runtime_memory.reflector import Reflector
 
     traces = _recent_traces(TRACES_DIR, RECENT_TRACE_LIMIT)
     if not traces:

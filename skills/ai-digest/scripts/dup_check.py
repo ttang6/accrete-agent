@@ -34,7 +34,7 @@ _PROJECT_ROOT = _SKILL_ROOT.parent.parent
 # 之间 dup 表互相污染。
 _HISTORY_PATH_DEFAULT = _PROJECT_ROOT / "data" / "memory" / "digest_reported.jsonl"
 _HISTORY_PATH = Path(
-    os.getenv("NANOAGENT_DIGEST_HISTORY_PATH", str(_HISTORY_PATH_DEFAULT))
+    os.getenv("ACCRETE_DIGEST_HISTORY_PATH", str(_HISTORY_PATH_DEFAULT))
 )
 
 

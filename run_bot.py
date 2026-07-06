@@ -1,4 +1,4 @@
-"""nanoagent v2 Telegram Bot 入口 — channel 薄壳。
+"""accrete v2 Telegram Bot 入口 — channel 薄壳。
 
 复用 main.py 的装配 builder，每个白名单 chat 一个独立 Harness（避免 _current_skill /
 _tracer 跨 chat 串扰），共享 SessionStore / SkillLoader / UserFacts / 各 lesson tracker
@@ -20,16 +20,16 @@ from typing import Optional
 from dotenv import load_dotenv
 
 import main as cli_main
-from nanoagent.core.llm_client import LLMClient
-from nanoagent.memory.user_facts import UserFacts
-from nanoagent.runtime.harness import Harness
-from nanoagent.runtime.session import SessionStore
-from nanoagent.runtime.telegram_channel import (
+from accrete.core.llm_client import LLMClient
+from accrete.memory.user_facts import UserFacts
+from accrete.runtime.harness import Harness
+from accrete.runtime.session import SessionStore
+from accrete.runtime.telegram_channel import (
     TelegramChannel,
     make_bootstrap_session_key,
     make_session_key_prefix,
 )
-from nanoagent.skills.loader import SkillLoader
+from accrete.skills.loader import SkillLoader
 
 # ============================================================
 # 运行参数

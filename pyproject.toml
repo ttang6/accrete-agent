@@ -1,5 +1,5 @@
 [project]
-name = "nanoagent"
+name = "accrete-agent"
 version = "0.2.0"
 description = "Lightweight agent framework that learns from failure traces, aligned with nanobot philosophy."
 requires-python = ">=3.11"
@@ -41,16 +41,16 @@ telegram = [
     "python-telegram-bot>=22.7",
     "python-dotenv>=1.0",
 ]
-# MCP client + MCPTool（src/nanoagent/mcp/client.py、src/nanoagent/tool/mcp_tool.py）依赖。
+# MCP client + MCPTool（src/accrete/mcp/client.py、src/accrete/tool/mcp_tool.py）依赖。
 # 激活：`uv pip install -e ".[mcp]"`。fastmcp 是高层 MCP 客户端（吃标准 MCPConfig、自动
 # 管传输 / 多 server），会顺带带上主依赖里的官方 mcp。
 mcp = [
     "fastmcp>=3.0",
 ]
-# OTel GenAI 语义约定导出（src/nanoagent/observability/otel_export.py）。
+# OTel GenAI 语义约定导出（src/accrete/observability/otel_export.py）。
 # 激活：`uv pip install -e ".[otel]"`。可观测互操作层——把 trace 导成行业标准
 # OTel span，任何 OTel 后端（Jaeger / CozeLoop / LoongSuite）可直接吃。默认不装、
-# 默认不开（守 NANOAGENT_OTEL 环境变量）；缺依赖时导出静默 no-op，不影响主流程。
+# 默认不开（守 ACCRETE_OTEL 环境变量）；缺依赖时导出静默 no-op，不影响主流程。
 otel = [
     "opentelemetry-sdk>=1.20",
     "opentelemetry-exporter-otlp-proto-http>=1.20",
@@ -64,4 +64,4 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-nanoagent = ["py.typed"]
+accrete = ["py.typed"]

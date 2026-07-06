@@ -1,4 +1,4 @@
-"""nanoagent v2 CLI 入口 — channel 薄壳。
+"""accrete v2 CLI 入口 — channel 薄壳。
 
 装配：LLMClient + ToolRegistry + MainLoop + SessionStore + SkillLoader + UserFacts
       + Harness（channel-agnostic orchestrator）
@@ -16,39 +16,39 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from nanoagent.core.llm_client import LLMClient
-from nanoagent.core.prompt_assets import load_prompt
-from nanoagent.runtime.subagent import SubAgentRunner, build_subagent_llm
-from nanoagent.memory.global_memory import GlobalMemory
-from nanoagent.memory.global_memory_distiller import GlobalMemoryDistiller
-from nanoagent.evolution.runtime_memory.lesson_ingestor import LessonIngestor
-from nanoagent.evolution.runtime_memory.lesson_retriever import LessonRetriever
-from nanoagent.evolution.runtime_memory.online_reflector import OnlineReflector
-from nanoagent.evolution.runtime_memory.outcome_tracker import OutcomeTracker
-from nanoagent.evolution.runtime_memory.sqlite_backend import (
+from accrete.core.llm_client import LLMClient
+from accrete.core.prompt_assets import load_prompt
+from accrete.runtime.subagent import SubAgentRunner, build_subagent_llm
+from accrete.memory.global_memory import GlobalMemory
+from accrete.memory.global_memory_distiller import GlobalMemoryDistiller
+from accrete.evolution.runtime_memory.lesson_ingestor import LessonIngestor
+from accrete.evolution.runtime_memory.lesson_retriever import LessonRetriever
+from accrete.evolution.runtime_memory.online_reflector import OnlineReflector
+from accrete.evolution.runtime_memory.outcome_tracker import OutcomeTracker
+from accrete.evolution.runtime_memory.sqlite_backend import (
     DEFAULT_DB_PATH as _DEFAULT_LESSONS_DB_PATH,
     SqliteMemoryBackend,
 )
-from nanoagent.memory.user_facts import UserFacts
-from nanoagent.core.paths import data_dir
-from nanoagent.runtime.context_budget import ContextBudgetConfig
-from nanoagent.runtime.harness import Harness
-from nanoagent.runtime.interrupt import RunInterrupt
-from nanoagent.runtime.main_loop import MainLoop
-from nanoagent.runtime.session import SessionStore
-from nanoagent.runtime.token_counter import TokenCounter
-from nanoagent.runtime.tool_output_store import ToolOutputStore
-from nanoagent.skills.loader import SkillLoader
-from nanoagent.tool.arxiv import ArxivTool
-from nanoagent.tool.describe_script import DescribeScriptTool
-from nanoagent.tool.fetch import FetchTool
-from nanoagent.tool.glob import GlobTool
-from nanoagent.tool.grep import GrepTool
-from nanoagent.tool.load_skill import LoadSkillTool
-from nanoagent.tool.registry import ToolRegistry
-from nanoagent.tool.search import SearchTool
-from nanoagent.tool.skill_exec import SkillExecTool
-from nanoagent.tool.subagent_tool import SubAgentTool
+from accrete.memory.user_facts import UserFacts
+from accrete.core.paths import data_dir
+from accrete.runtime.context_budget import ContextBudgetConfig
+from accrete.runtime.harness import Harness
+from accrete.runtime.interrupt import RunInterrupt
+from accrete.runtime.main_loop import MainLoop
+from accrete.runtime.session import SessionStore
+from accrete.runtime.token_counter import TokenCounter
+from accrete.runtime.tool_output_store import ToolOutputStore
+from accrete.skills.loader import SkillLoader
+from accrete.tool.arxiv import ArxivTool
+from accrete.tool.describe_script import DescribeScriptTool
+from accrete.tool.fetch import FetchTool
+from accrete.tool.glob import GlobTool
+from accrete.tool.grep import GrepTool
+from accrete.tool.load_skill import LoadSkillTool
+from accrete.tool.registry import ToolRegistry
+from accrete.tool.search import SearchTool
+from accrete.tool.skill_exec import SkillExecTool
+from accrete.tool.subagent_tool import SubAgentTool
 
 # ============================================================
 # 运行参数（改这里就改行为，不需要命令行）
@@ -98,7 +98,7 @@ LESSONS_DB_PATH: Path = _DEFAULT_LESSONS_DB_PATH  # SSOT 在 sqlite_backend.DEFA
 def _env_bool(name: str, default: bool) -> bool:
     """env override helper：未设 / 空字符串 → default；'0'/'false'/'no' → False；其他 truthy → True。
 
-    eval harness 用 NANOAGENT_ENABLE_LESSON_RECALL=0 跑 baseline、=1 跑 evolved，
+    eval harness 用 ACCRETE_ENABLE_LESSON_RECALL=0 跑 baseline、=1 跑 evolved，
     同一份代码两种模式不必改源文件。"""
     raw = os.getenv(name)
     if raw is None or raw == "":
@@ -106,11 +106,11 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
-ENABLE_LESSON_RECALL: bool = _env_bool("NANOAGENT_ENABLE_LESSON_RECALL", True)  # Phase C：第 1 次失败时也查 backend 中的 promoted lesson
-ENABLE_ONLINE_REFLECTOR: bool = _env_bool("NANOAGENT_ONLINE_REFLECTOR", False)  # 在线微反思，默认关（待小测验证）
+ENABLE_LESSON_RECALL: bool = _env_bool("ACCRETE_ENABLE_LESSON_RECALL", True)  # Phase C：第 1 次失败时也查 backend 中的 promoted lesson
+ENABLE_ONLINE_REFLECTOR: bool = _env_bool("ACCRETE_ONLINE_REFLECTOR", False)  # 在线微反思，默认关（待小测验证）
 # 滑窗失败率总闸（Track A-b.4）。默认开（生产兜底）。Track E eval 关掉：实测它在 R2
 # 上抢在熔断器降级完成前掐断、抹平熔断收益（详见 main_loop 注释）。
-ENABLE_FAILURE_RATE_GATE: bool = _env_bool("NANOAGENT_ENABLE_FAILURE_RATE_GATE", True)
+ENABLE_FAILURE_RATE_GATE: bool = _env_bool("ACCRETE_ENABLE_FAILURE_RATE_GATE", True)
 
 # 刀4：PromotionGate/状态机已删——lesson 治理改为 lesson_score 从账本派生的
 # 单分数注入闸（score ≥ T）。晋升/降级/退休全塌成"过没过线",无独立 gate。
@@ -392,7 +392,7 @@ def _run_turn_interruptible(harness: Harness, text: str, interrupt: RunInterrupt
 
 def repl(harness: Harness, interrupt: RunInterrupt) -> int:
     """CLI channel：只管 stdin/stdout，编排走 harness.handle。"""
-    header = "nanoagent v2 REPL。"
+    header = "accrete v2 REPL。"
     n_sessions = len(harness.list_sessions())
     if n_sessions > 0:
         header += f"已存 {n_sessions} 个历史会话（首句消息默认开新会话；用 /resume <key> 续上）。"

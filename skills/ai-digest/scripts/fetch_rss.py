@@ -33,7 +33,7 @@ _NOISE_KEYWORDS = {
 }
 
 _WINDOW_HOURS = 48
-_USER_AGENT = "Mozilla/5.0 (compatible; nanoagent/0.2)"
+_USER_AGENT = "Mozilla/5.0 (compatible; accrete/0.2)"
 _FEED_WORKERS = 10
 _FULLTEXT_WORKERS = 8
 _FULLTEXT_TIMEOUT = 10

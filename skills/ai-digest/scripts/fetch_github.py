@@ -28,7 +28,7 @@ _PROJECT_ROOT = _SKILL_ROOT.parent.parent
 _CACHE_DIR = _PROJECT_ROOT / "data" / "cache" / "github_trending"
 
 HTTP_TIMEOUT = 15
-_USER_AGENT = "Mozilla/5.0 (compatible; nanoagent/0.2)"
+_USER_AGENT = "Mozilla/5.0 (compatible; accrete/0.2)"
 
 
 def _cache_path(language: str, since: str) -> Path:

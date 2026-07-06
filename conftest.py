@@ -1,7 +1,7 @@
 """顶层 conftest.py —— 仅为把仓库根挂进 pytest 的 sys.path。
 
 为什么需要：
-- 项目用 src/ layout：`nanoagent` 通过 setuptools editable install 进入 sys.path
+- 项目用 src/ layout：`accrete` 通过 setuptools editable install 进入 sys.path
 - 但 `evals/` 是 dev tool（eval harness），故意不在 src/ 也不入安装包
 - pytest 默认不把项目根加进 sys.path → `from evals.grader import ...` 失败
 
