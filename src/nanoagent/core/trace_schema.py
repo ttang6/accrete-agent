@@ -8,7 +8,7 @@ promoted hints），必须先冻结 action 名 + 每 action 的预期字段，�
 - 每个 trace event 的 action 名 = 一个 `Final[str]` 常量
 - 常量上方两行注释：**emit 位置 + 预期字段**
 - `ALL_ACTIONS` frozenset 聚合全部——consumer 可用它做 sanity check
-- 使用方式：`_trace(action=ACTION_COVERAGE_CHECK, ...)`（而不是字符串字面量）
+- 使用方式：`_trace(action=ACTION_TOOL_CALL_END, ...)`（而不是字符串字面量）
 
 命名约定：
 - `ACTION_<VERB>_<NOUN>`: e.g. `ACTION_LLM_CALL_START`, `ACTION_TOOL_CALL_END`
@@ -45,27 +45,12 @@ ACTION_LLM_CALL_END: Final[str] = "llm_call_end"
 # episode_extractor 仍保留 START 分支作向后兼容兜底（读旧 trace），但新 trace 不产 START。
 ACTION_TOOL_CALL_START: Final[str] = "tool_call_start"
 
-# emit: MainLoop._emit_tool_op_node, tool execute + augment/breaker/coverage 之后（单节点）
+# emit: MainLoop._after_tool_record_to_trace, tool execute + augment/breaker/coverage 之后（单节点）
 # fields: iteration(int), tool(str), input(str, raw_args[:200]), output(str[:300]),
-#         status("ok"|"failed"), op_key(str, 细键含 args-hash), klass(str, 失败时),
+#         status("ok"|"failed"), call_key(str, 细键含 args-hash), klass(str, 失败时),
 #         error_type(str, 粗 substring 分类), is_mutating(bool), duration_ms(int, 真耗时)
-# 注：error_class(5 类)/cause_sig 是冷路径派生（需 episode 上下文），不在本节点。
+# 注：failure_class/failure_reason 是冷路径派生（需 episode 上下文），不在本节点。
 ACTION_TOOL_CALL_END: Final[str] = "tool_call_end"
-
-
-# ============================================================
-# Coverage 事件
-# ============================================================
-
-# emit: MainLoop._run_inner, 成功 observe() 一次 ai-digest fetch_* 输出后
-# fields: iteration(int), tool(str), category(enum:paper|news|oss), running_max(int)
-ACTION_COVERAGE_CHECK: Final[str] = "coverage_check"
-
-# emit: MainLoop._run_inner, 本 iter tool 循环结束后硬覆盖不达标时
-# fields: iteration(int), missing(list[str]), counts(dict[str,int]),
-#         observed_empty(list[str]) —— 事实空源已 confirmed 的 category，已从
-#         missing 中排除；保持向后兼容时 caller 可忽略
-ACTION_COVERAGE_HINT_INJECTED: Final[str] = "coverage_hint_injected"
 
 
 # ============================================================
@@ -91,8 +76,8 @@ ACTION_STOP_CONDITION_MET: Final[str] = "stop_condition_met"
 # Circuit breaker 事件（per-op 熔断，禁该 op 本轮、turn 继续）
 # ============================================================
 
-# emit: MainLoop._maybe_trip_breaker, 某 op_key 连续失败达 klass policy 阈值时
-# fields: iteration(int), tool(str), op_key(str), klass(str), failure_count(int),
+# emit: MainLoop._after_tool_loop_guard, 某 call_key 连续失败达 klass policy 阈值时
+# fields: iteration(int), tool(str), call_key(str), klass(str), failure_count(int),
 #         threshold(int), is_mutating(bool)
 # 语义：该 op 本轮被禁，后续同 op 调用直接回 [gate-circuit-open] 消息不执行；turn 继续。
 ACTION_CIRCUIT_OPEN: Final[str] = "circuit_open"
@@ -109,6 +94,13 @@ ACTION_FINISH: Final[str] = "finish"
 # emit: MainLoop.run, top-level try/except 捕获未处理异常
 # fields: error_class, is_transient, error_message, error_type, context_tags, action
 ACTION_RUN_ERROR: Final[str] = "run_error"
+
+# emit: MainLoop._finish_interrupted, 用户在步边界协作式打断（Ctrl-C）时
+# fields: iteration(int, 停下的步边界序号), partial_output(str, 截断 500)
+# 语义：用户主动叫停，本轮未自然收尾。iteration 是**停下的步边界**（该步未执行）——
+# 作为带步级位置的隐式标注，读作"用户认为问题不晚于此步"。其后紧跟一条
+# reason="user_interrupt" 的 FINISH（沿 STOP_CONDITION_MET→FINISH 的收尾惯例）。
+ACTION_USER_INTERRUPT: Final[str] = "user_interrupt"
 
 
 # ============================================================
@@ -137,10 +129,10 @@ ACTION_EVALUATOR_RETRY_TRIGGERED: Final[str] = "evaluator_retry_triggered"
 # ============================================================
 
 # emit: MainLoop._run_inner, FailureMemory.maybe_augment 命中 backend lesson 时
-# fields: iteration(int), tool(str), lesson_id(str), error_class(str), confidence(float)
+# fields: iteration(int), tool(str), lesson_id(str), failure_class(str)
 ACTION_LESSON_USED: Final[str] = "lesson_used"
 
-# emit: MainLoop._augment_with_failure_memory, FailureMemory 第 2 次同 op 失败
+# emit: MainLoop._after_tool_recall_lesson, FailureMemory 第 2 次同 op 失败
 #       触发 OnlineReflector 且产出 suggestion 时
 # fields: iteration(int), tool(str), diagnosis(str, 截断), has_suggested_args(bool)
 # 语义：在线微反思注入了 [learned-fix] 修复假设（未验证；采纳与否由主 LLM
@@ -201,16 +193,8 @@ ACTION_CONTEXT_BUDGET_WARNING: Final[str] = "context_budget_warning"
 ACTION_CONTEXT_BUDGET_EXCEEDED: Final[str] = "context_budget_exceeded"
 
 
-# ============================================================
-# PromotionGate 审计事件
-# ============================================================
-
-# emit: PromotionGate.sweep 内 apply 成功后（如果 caller 提供 audit_callback 写 trace）
-# fields: lesson_id(str), from_status(str), to_status(str), reason(str),
-#         evidence_episode_ids(list[str], 截断 ≤10)
-# 语义：lesson 状态自动转移的审计记录。当前默认仅写 _logger.info；trace event
-# wiring 留给 caller 选择（sweep 时 RunTracer 已 finalize，不能直接写）。
-ACTION_LESSON_STATUS_CHANGED: Final[str] = "lesson_status_changed"
+# PromotionGate 审计事件已删（lesson 无存储状态转移可审计——注入资格是
+# lesson_score 从账本现算的派生量）。
 
 
 # ============================================================
@@ -218,10 +202,9 @@ ACTION_LESSON_STATUS_CHANGED: Final[str] = "lesson_status_changed"
 # 中可见，grader 才能量化飞轮真改善
 # ============================================================
 
-# emit: Harness._maybe_consume_trace_outcomes 在 OutcomeTracker.process_trace_path
+# emit: Harness._after_turn_update_trace_outcomes 在 OutcomeTracker.process_trace_path
 # 后，针对每条 OutcomeUpdate 调 RunTracer.append_post_save 追加到 JSONL
-# fields: lesson_id(str), outcome(str: helped|hurt|ineffective),
-#         new_confidence(float), new_hit_count(int)
+# fields: lesson_id(str), outcome(str: helped|hurt|ineffective), new_hit_count(int)
 # 注意：emit 时机是 RunTracer.save() 之后——文件已关闭，需用专门的
 # append_post_save 路径重新 open(append) 写入再 close。trace 末尾出现
 # `outcome_update` 行属正常（grader 全量遍历 events 已支持）。
@@ -237,13 +220,12 @@ ALL_ACTIONS: Final[frozenset[str]] = frozenset({
     ACTION_LLM_CALL_END,
     ACTION_TOOL_CALL_START,
     ACTION_TOOL_CALL_END,
-    ACTION_COVERAGE_CHECK,
-    ACTION_COVERAGE_HINT_INJECTED,
     ACTION_FAILURE_RECOVERY_HINT,
     ACTION_STOP_CONDITION_MET,
     ACTION_CIRCUIT_OPEN,
     ACTION_FINISH,
     ACTION_RUN_ERROR,
+    ACTION_USER_INTERRUPT,
     ACTION_EVALUATOR_CALL_START,
     ACTION_EVALUATOR_CALL_END,
     ACTION_EVALUATOR_RETRY_TRIGGERED,
@@ -256,7 +238,6 @@ ALL_ACTIONS: Final[frozenset[str]] = frozenset({
     ACTION_TOOL_OUTPUT_TRUNCATED,
     ACTION_CONTEXT_BUDGET_WARNING,
     ACTION_CONTEXT_BUDGET_EXCEEDED,
-    ACTION_LESSON_STATUS_CHANGED,
     ACTION_OUTCOME_UPDATE,
 })
 

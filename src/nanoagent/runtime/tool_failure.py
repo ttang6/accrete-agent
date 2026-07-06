@@ -17,8 +17,6 @@ LessonIngestor 不入库 → 飞轮断链。
 import 路径**不变**），但物理上共享同一对象（`is` 相等）。
 
 不在范围：
-- `_LABEL_BRIDGE`（见 `lesson_retriever.py`）—— 那是 FM 3 标签 → TraceErrorClassifier
-  5 类的桥接，不是重复，留在原地
 - `_SUGGESTED_NEXT_ACTION` —— 仅 `failure_memory.maybe_augment` 用，不是重复，留在原地
 - `_failure_key` / `_build_tool_key` —— 两边 schema 不同（tuple vs str），保持原样
 

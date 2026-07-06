@@ -113,7 +113,7 @@ def check_repeated_failure(
         should_stop=True,
         reason=StopReason.REPEATED_FAILURE,
         details={
-            "tool_key": first_hit["tool_key"],
+            "op": first_hit["op"],
             "args_hash": first_hit["args_hash"],
             "failure_count": first_hit["failure_count"],
             "last_error_type": first_hit["last_error_type"],
@@ -142,7 +142,7 @@ def format_forced_stop_message(decision: StopDecision) -> str:
         return (
             f"检测到同一意图连续失败 {d.get('failure_count', '?')} 次（超过阈值 "
             f"{d.get('threshold', '?')}），已主动终止本轮以避免继续消耗。\n"
-            f"- 失败意图：`{d.get('tool_key', '?')}`\n"
+            f"- 失败意图：`{d.get('op', '?')}`\n"
             f"- 错误类型：{d.get('last_error_type', '?')}\n"
             f"- 建议下一步：{d.get('suggested_next_action', '?')}"
         )

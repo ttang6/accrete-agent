@@ -9,7 +9,7 @@ failure_count（供 stop_condition.check_repeated_failure 防循环 loop guard �
 可选 `online_reflector`（在线微反思）：同意图（recall_key）第 2 次失败且飞轮
 无可召回的 suggested_action 时，副 LLM 基于报错产一个 [learned-fix] 修复
 假设注入——覆盖"飞轮产不出修复教训"的 hard-tail（默认不装配，开关见 main.py）。
-触发计数特意用意图级而非 op_key（带 args-hash）：换参重试仍失败才最需要外脑。
+触发计数特意用意图级而非 call_key（带 args-hash）：换参重试仍失败才最需要外脑。
 
 入门友好视角：
 - 一个 turn（MainLoop.run）创建一份 FailureMemory，run 结束就扔掉
@@ -137,8 +137,8 @@ class FailureMemory:
     # Optional["LessonRetriever"] 字面量化避免运行时 import 循环
     lesson_retriever: Optional["LessonRetriever"] = None
     # 在线微反思（可选）：同意图第 2 次失败且飞轮无 suggested_action 时产修复假设。
-    # 触发计数用 recall_key（意图级，skill_exec:skill/script）而非 op_key（带
-    # args-hash）——模型"换着参数重试仍失败"恰恰是最需要外脑的时刻，按 op_key
+    # 触发计数用 recall_key（意图级，skill_exec:skill/script）而非 call_key（带
+    # args-hash）——模型"换着参数重试仍失败"恰恰是最需要外脑的时刻，按 call_key
     # 计数会把每次变参当新 op、永远凑不满 2 次（冒烟实测踩到）。
     online_reflector: Optional["OnlineReflector"] = None
     reflector_calls: int = 0
@@ -150,7 +150,7 @@ class FailureMemory:
 
     def maybe_augment(
         self, tool_name: str, kwargs: dict, raw_args: str, result: str,
-        *, op_key: Optional[str] = None, lesson_key: Optional[str] = None,
+        *, call_key: Optional[str] = None, op: Optional[str] = None,
     ) -> Tuple[str, Optional[FailureEntry], Optional["RuntimeLesson"]]:
         """观察一次 tool 输出，若是失败则尝试 augment。
 
@@ -165,10 +165,10 @@ class FailureMemory:
             假设（见 _maybe_reflect），suggestion 存 pending_reflector_event
             供 main_loop 读后清空
 
-        计数键（count_key）：优先用工具自声明的 `op_key`（main_loop 从
-        `tool.op_key(kwargs)` 取，是熔断器也会用的同一把键——单一计数源不漂移）；
-        op_key 为 None 时退回 `_operation_key` 的默认投影（直接调用 / 单测路径）。
-        lesson 召回键（recall_key）优先用工具自声明的 `lesson_key`（F1 单一携带源，
+        计数键（count_key）：优先用工具自声明的 `call_key`（main_loop 从
+        `tool.call_key(kwargs)` 取，是熔断器也会用的同一把键——单一计数源不漂移）；
+        call_key 为 None 时退回 `_operation_key` 的默认投影（直接调用 / 单测路径）。
+        lesson 召回键（recall_key）优先用工具自声明的 `op`（F1 单一携带源，
         与操作节点 / episode_extractor 存储键同一来源、不再手工对齐）；缺省退回
         `_operation_key` 的 legacy 投影（与计数粒度有意不同）。
 
@@ -181,17 +181,17 @@ class FailureMemory:
             return (result, None, None)
 
         default_count_key, default_recall_key = _operation_key(tool_name, kwargs, raw_args)
-        count_key = op_key if op_key is not None else default_count_key
-        # recall_key 优先用工具自声明的 lesson_key（F1 单一携带源，与节点 / episode 存储同键）；
+        count_key = call_key if call_key is not None else default_count_key
+        # recall_key 优先用工具自声明的 op（F1 单一携带源，与节点 / episode 存储同键）；
         # 缺省（直接调用 / 单测 / tool 不在 registry）退回 _operation_key 的 legacy 投影。
-        recall_key = lesson_key if lesson_key is not None else default_recall_key
+        recall_key = op if op is not None else default_recall_key
         args_hash = _canonical_args_hash(raw_args)
         error_type = _classify_tool_failure(result)
         self.intent_failures[recall_key] = self.intent_failures.get(recall_key, 0) + 1
         entry = self.entries.get(count_key)
 
         if entry is None:
-            # 首次失败（按 op_key）：记录 + 查 backend promoted lesson（用 recall_key）
+            # 首次失败（按 call_key）：记录 + 查 backend promoted lesson（用 recall_key）
             self.entries[count_key] = FailureEntry(
                 failure_count=1,
                 last_error_type=error_type,
@@ -200,7 +200,7 @@ class FailureMemory:
             )
             if self.lesson_retriever is not None:
                 lesson = self.lesson_retriever.try_recall(
-                    tool_key=recall_key, error_type=error_type
+                    op=recall_key, error_type=error_type
                 )
                 if lesson is not None:
                     return (
@@ -208,11 +208,11 @@ class FailureMemory:
                         None,
                         lesson,
                     )
-            # 换 args 重试仍失败 → op_key 是新 entry 但意图级已 ≥2 次，微反思照触发
+            # 换 args 重试仍失败 → call_key 是新 entry 但意图级已 ≥2 次，微反思照触发
             hint = self._maybe_reflect(recall_key, count_key, error_type, raw_args, result)
             return (result + hint if hint else result, None, None)
 
-        # 2nd+ 次失败（同 op_key）：累加 failure_count（供 stop_condition loop guard）。
+        # 2nd+ 次失败（同 call_key）：累加 failure_count（供 stop_condition loop guard）。
         # harness-recovery hint 已退役；唯一可能的注入是在线微反思。
         entry.failure_count += 1
         entry.last_error_type = error_type
@@ -244,7 +244,7 @@ class FailureMemory:
         self.reflector_fired.add(recall_key)
         self.reflector_calls += 1
         suggestion = self.online_reflector.try_suggest(
-            tool_key=count_key, raw_args=raw_args, error_output=result,
+            op=count_key, raw_args=raw_args, error_output=result,
         )
         if suggestion is None:
             return None
@@ -260,7 +260,7 @@ class FailureMemory:
         if self.lesson_retriever is None:
             return False
         lesson = self.lesson_retriever.try_recall(
-            tool_key=recall_key, error_type=error_type
+            op=recall_key, error_type=error_type
         )
         return lesson is not None and lesson.example is not None
 
@@ -272,11 +272,11 @@ class FailureMemory:
         """把每条 entry yield 成普通 dict（直接 for-loop 消费）。
 
         shape 与 ReflexionRecord 对齐方便未来 `.to_reflexion_record(trace_id)` 一行转换：
-          {tool_key, args_hash, failure_count, last_error_type, suggested_next_action}
+          {op, args_hash, failure_count, last_error_type, suggested_next_action}
         """
-        for tool_key, entry in self.entries.items():
+        for op, entry in self.entries.items():
             yield {
-                "tool_key": tool_key,
+                "op": op,
                 "args_hash": entry.last_args_hash,
                 "failure_count": entry.failure_count,
                 "last_error_type": entry.last_error_type,
