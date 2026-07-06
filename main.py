@@ -11,6 +11,7 @@
 """
 
 import os
+import signal
 import sys
 from pathlib import Path
 from typing import Optional
@@ -24,8 +25,6 @@ from nanoagent.evolution.runtime_memory.lesson_ingestor import LessonIngestor
 from nanoagent.evolution.runtime_memory.lesson_retriever import LessonRetriever
 from nanoagent.evolution.runtime_memory.online_reflector import OnlineReflector
 from nanoagent.evolution.runtime_memory.outcome_tracker import OutcomeTracker
-from nanoagent.evolution.runtime_memory.promotion_audit import JsonlAuditWriter
-from nanoagent.evolution.runtime_memory.promotion_gate import PromotionGate
 from nanoagent.evolution.runtime_memory.sqlite_backend import (
     DEFAULT_DB_PATH as _DEFAULT_LESSONS_DB_PATH,
     SqliteMemoryBackend,
@@ -33,13 +32,12 @@ from nanoagent.evolution.runtime_memory.sqlite_backend import (
 from nanoagent.memory.user_facts import UserFacts
 from nanoagent.core.paths import data_dir
 from nanoagent.runtime.context_budget import ContextBudgetConfig
-from nanoagent.runtime.critic import Critic
 from nanoagent.runtime.harness import Harness
+from nanoagent.runtime.interrupt import RunInterrupt
 from nanoagent.runtime.main_loop import MainLoop
 from nanoagent.runtime.session import SessionStore
 from nanoagent.runtime.token_counter import TokenCounter
 from nanoagent.runtime.tool_output_store import ToolOutputStore
-from nanoagent.skills.contract import aggregate_coverage_specs
 from nanoagent.skills.loader import SkillLoader
 from nanoagent.tool.arxiv import ArxivTool
 from nanoagent.tool.describe_script import DescribeScriptTool
@@ -114,21 +112,8 @@ ENABLE_ONLINE_REFLECTOR: bool = _env_bool("NANOAGENT_ONLINE_REFLECTOR", False)  
 # 上抢在熔断器降级完成前掐断、抹平熔断收益（详见 main_loop 注释）。
 ENABLE_FAILURE_RATE_GATE: bool = _env_bool("NANOAGENT_ENABLE_FAILURE_RATE_GATE", True)
 
-# Phase E-v1：PromotionGate 自动 candidate ↔ promoted ↔ retired 决策。
-# 阈值都是 v1 拍脑袋（advisor 反对的那个但温和），靠 P2 INEFFECTIVE 自动降级机制
-# 把"promote 错"的代价压低。等真实 stats 沉淀后用 nanoagent.lesson list --json 校准。
-#
-# PR 4：阈值也可由环境变量 `NANOAGENT_PROMOTION_*` 覆盖（promotion_gate.py 模块级
-# 一次性读，进程启动后不热重载）。下面 4 个常量是 main.py 默认装配传入值——同时
-# 也是文档常量，env 优先级最高。
-ENABLE_PROMOTION_GATE: bool = _env_bool("NANOAGENT_ENABLE_PROMOTION_GATE", True)
-PROMOTION_EVIDENCE_MIN: int = 3  # candidate 被 N 个不同 trace 见过 → PROBATION（试用）
-PROMOTION_HELPED_MIN: int = 1    # E-v1.1：PROBATION 真用过且 helped ≥ N → PROMOTED
-PROMOTION_RETIRE_HURT_MIN: int = 3  # lesson 召回后真失败 ≥ N 次 → RETIRED
-PROMOTION_RETIRE_INEFFECTIVE_MIN: int = 3  # lesson 累计 INEFFECTIVE ≥ N → RETIRED
-# PR 4 follow-up：每次 sweep 命中转移追加一行 JSON 到此文件，事后用 jq / tail
-# 反推飞轮 lifecycle。父目录构造时自动创建；空字符串可关 audit。
-PROMOTION_AUDIT_LOG_PATH: Path = Path("data/runtime/lessons/promotion_audit.jsonl")
+# 刀4：PromotionGate/状态机已删——lesson 治理改为 lesson_score 从账本派生的
+# 单分数注入闸（score ≥ T）。晋升/降级/退休全塌成"过没过线",无独立 gate。
 
 # P4-lite D-context：Context Hygiene Foundation 默认开启
 ENABLE_CONTEXT_HYGIENE: bool = True
@@ -228,10 +213,8 @@ def build_runtime_memory(
     Optional[LessonRetriever],
     Optional[OutcomeTracker],
     Optional[LessonIngestor],
-    Optional[PromotionGate],
 ]:
-    """Phase C/D/B/E-v1：装配 SqliteMemoryBackend → 共享给 retriever / outcome /
-    ingestor / promotion_gate。
+    """Phase C/D/B：装配 SqliteMemoryBackend → 共享给 retriever / outcome / ingestor。
 
     sqlite_check_same_thread:
         CLI 默认 True（main thread 装配 + 使用，sqlite3 自带保护）。
@@ -245,13 +228,13 @@ def build_runtime_memory(
 
     生命周期：atexit 注册 backend.close()，进程退出时 commit + 释放 SQLite 句柄。
 
-    所有组件共享同一 backend：retriever 读 promoted lesson 注入 hint；
-    outcome_tracker 写已用 lesson 的 stats/confidence；ingestor 把 trace 失败
-    转 candidate lesson 入库；promotion_gate 在 turn 结束后扫所有 candidate /
-    promoted lesson 自动 promote / retire——四者同 SQLite 文件，事务一致。
+    所有组件共享同一 backend：retriever 读 active lesson（score≥T）注入 hint；
+    outcome_tracker 写已用 lesson 的 helped/hurt 账本；ingestor 把 trace 失败
+    转 candidate lesson 入库——三者同 SQLite 文件，事务一致。晋降退休由 lesson_score
+    从账本派生,无独立 gate。
     """
     if not ENABLE_LESSON_RECALL:
-        return None, None, None, None
+        return None, None, None
     try:
         import atexit
         backend = SqliteMemoryBackend(
@@ -259,22 +242,14 @@ def build_runtime_memory(
             check_same_thread=sqlite_check_same_thread,
         )
         atexit.register(backend.close)
-        gate = PromotionGate(
-            backend,
-            promote_evidence_min=PROMOTION_EVIDENCE_MIN,
-            promote_helped_min=PROMOTION_HELPED_MIN,
-            retire_hurt_min=PROMOTION_RETIRE_HURT_MIN,
-            retire_ineffective_min=PROMOTION_RETIRE_INEFFECTIVE_MIN,
-        ) if ENABLE_PROMOTION_GATE else None
         return (
             LessonRetriever(backend),
             OutcomeTracker(backend),
             LessonIngestor(backend),
-            gate,
         )
     except Exception as e:
         print(f"[main] runtime_memory 装配失败（已降级，agent 仍可正常启动）: {e}")
-        return None, None, None, None
+        return None, None, None
 
 
 def build_context_hygiene() -> tuple[
@@ -311,6 +286,7 @@ def build_loop(
     skill_loader: SkillLoader,
     *,
     lesson_retriever: Optional[LessonRetriever] = None,
+    interrupt: Optional[RunInterrupt] = None,
 ) -> MainLoop:
     """构造 MainLoop。lesson_retriever 由调用方装配——避免本函数重复 build
     SqliteBackend（Phase D 引入 OutcomeTracker 后需共享同一 backend）。
@@ -326,8 +302,6 @@ def build_loop(
         extra_body=MODEL_EXTRA_BODY,
     )
     counter, store, budget_cfg = build_context_hygiene()
-    contracts = [skill_loader.get_contract(n) for n in skill_loader.list_skills()]
-    coverage_specs = aggregate_coverage_specs(contracts) or None
     online_reflector = None
     if ENABLE_ONLINE_REFLECTOR and os.getenv("DASHSCOPE_API_KEY"):
         reflector_llm = LLMClient(
@@ -345,13 +319,13 @@ def build_loop(
         llm=llm,
         tool_registry=build_registry(skill_loader),
         max_iterations=MAX_ITERATIONS,
-        coverage_specs=coverage_specs,
         enable_failure_rate_gate=ENABLE_FAILURE_RATE_GATE,
         lesson_retriever=lesson_retriever,
         online_reflector=online_reflector,
         token_counter=counter,
         tool_output_store=store,
         context_budget_config=budget_cfg,
+        interrupt=interrupt,
     )
 
 
@@ -390,7 +364,33 @@ def run_once(loop: MainLoop, task: str) -> int:
     return 0
 
 
-def repl(harness: Harness) -> int:
+def _run_turn_interruptible(harness: Harness, text: str, interrupt: RunInterrupt):
+    """跑一个 turn，期间把 Ctrl-C 转成协作式打断（步边界停）。
+
+    turn 外（idle 的 input()）仍是默认 KeyboardInterrupt 退出语义——本函数只在 turn
+    期间临时接管 SIGINT，结束后原样还回。非主线程 / 平台不支持装 handler 时退回普通
+    handle（无协作式打断，行为不变）。
+    """
+    interrupt.reset()
+    requested_once = {"v": False}
+
+    def _on_sigint(signum, frame):
+        if not requested_once["v"]:
+            requested_once["v"] = True
+            print("\n[打断] 已请求停止，当前步跑完即停…", flush=True)
+        interrupt.request()
+
+    try:
+        prev = signal.signal(signal.SIGINT, _on_sigint)
+    except (ValueError, OSError):
+        return harness.handle(text)
+    try:
+        return harness.handle(text)
+    finally:
+        signal.signal(signal.SIGINT, prev)
+
+
+def repl(harness: Harness, interrupt: RunInterrupt) -> int:
     """CLI channel：只管 stdin/stdout，编排走 harness.handle。"""
     header = "nanoagent v2 REPL。"
     n_sessions = len(harness.list_sessions())
@@ -398,7 +398,8 @@ def repl(harness: Harness) -> int:
         header += f"已存 {n_sessions} 个历史会话（首句消息默认开新会话；用 /resume <key> 续上）。"
     header += (
         "\n命令：/skills | /skill <name> | /profile | "
-        "/sessions [all|<n>] | /new (=/clear) | /resume <key> | exit"
+        "/sessions [all|<n>] | /new (=/clear) | /resume <key> | /rewind [n] | exit"
+        "\n（跑任务时按 Ctrl-C 协作式打断：当前步跑完即停，不丢 trace）"
     )
     print(header)
 
@@ -416,7 +417,7 @@ def repl(harness: Harness) -> int:
         if not text:
             continue
 
-        resp = harness.handle(text)
+        resp = _run_turn_interruptible(harness, text, interrupt)
         if resp.kind == "system":
             print(resp.content)
         else:
@@ -445,8 +446,11 @@ def main() -> int:
     # LoadSkillTool 依赖 loader 的动态 description，必须先建好 loader
     # Phase D：lesson_retriever + outcome_tracker 共享同一 SqliteBackend
     loader = SkillLoader(SKILLS_DIR)
-    lesson_retriever, outcome_tracker, lesson_ingestor, promotion_gate = build_runtime_memory()
-    loop = build_loop(loader, lesson_retriever=lesson_retriever)
+    lesson_retriever, outcome_tracker, lesson_ingestor = build_runtime_memory()
+    # 协作式打断标志：REPL 的 Ctrl-C 处理器置位，MainLoop 步边界查（one-shot 也传，
+    # 走 run() 的 KeyboardInterrupt 兜底路径）。
+    interrupt = RunInterrupt()
+    loop = build_loop(loader, lesson_retriever=lesson_retriever, interrupt=interrupt)
 
     task = resolve_task()
     if task:
@@ -460,7 +464,7 @@ def main() -> int:
     # EVALUATOR_* 常量沿用为 critic 子 LLM 的配置（model/provider/timeout/封顶轮数）。
     has_dashscope = bool(os.getenv("DASHSCOPE_API_KEY"))
 
-    critic = None
+    critic_llm = None
     if has_dashscope:
         critic_llm = LLMClient(
             model=EVALUATOR_MODEL,
@@ -468,17 +472,10 @@ def main() -> int:
             instance_name="critic",
             timeout=EVALUATOR_TIMEOUT,
         )
-        critic = Critic(llm=critic_llm)
         print(f"[Critic] enabled: {EVALUATOR_PROVIDER}/{EVALUATOR_MODEL} "
               f"(timeout={EVALUATOR_TIMEOUT}s, max_revise={EVALUATOR_MAX_RETRIES})")
 
     print_llm_instances()
-
-    promotion_audit_callback = (
-        JsonlAuditWriter(PROMOTION_AUDIT_LOG_PATH)
-        if promotion_gate is not None and PROMOTION_AUDIT_LOG_PATH
-        else None
-    )
 
     # 全局自动记忆（Dream-lite）：GlobalMemory 总建（只读也要能注入 prompt）；distiller
     # 守 DASHSCOPE_API_KEY，缺失 → None（记忆只读、不更新）。
@@ -497,12 +494,10 @@ def main() -> int:
         user_facts=user_facts,
         session_key=CLI_SESSION_KEY,
         base_identity=BASE_IDENTITY,
-        critic=critic,
+        critic_llm=critic_llm,
         critic_max_revise=EVALUATOR_MAX_RETRIES,
         outcome_tracker=outcome_tracker,
         lesson_ingestor=lesson_ingestor,
-        promotion_gate=promotion_gate,
-        promotion_audit_callback=promotion_audit_callback,
         session_history_warn_tokens=SESSION_HISTORY_WARN_TOKENS,
         global_memory=global_memory,
         global_memory_distiller=global_memory_distiller,
@@ -510,7 +505,7 @@ def main() -> int:
         auto_distill_overflow_ratio=AUTO_DISTILL_OVERFLOW_RATIO,
         auto_distill_switch_ratio=AUTO_DISTILL_SWITCH_RATIO,
     )
-    return repl(harness)
+    return repl(harness, interrupt)
 
 
 if __name__ == "__main__":

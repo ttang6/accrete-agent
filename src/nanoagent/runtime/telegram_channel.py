@@ -99,8 +99,8 @@ class TelegramChannel:
         self._running = False
         # 单 worker 线程池：harness.handle 全部跑在同一 thread，匹配
         # SqliteMemoryBackend 的 sqlite3 默认 check_same_thread=True 约束。
-        # 单 owner 场景下多 chat 串行处理影响极小，换来 PromotionGate /
-        # OutcomeTracker / LessonIngestor 的 SQLite 句柄不跨线程出错。
+        # 单 owner 场景下多 chat 串行处理影响极小，换来 OutcomeTracker /
+        # LessonIngestor 的 SQLite 句柄不跨线程出错。
         self._handler_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="nanoagent-handler"
         )
@@ -276,7 +276,7 @@ class TelegramChannel:
             # Harness.handle 是同步的（loop.run 内部同步），扔单 worker 线程池跑——
             # 既不阻塞 asyncio 主循环，又保证 SqliteMemoryBackend 的句柄始终在同一
             # thread（SQLite 默认 check_same_thread=True；跨 thread 用会抛
-            # ProgrammingError → PromotionGate sweep fail-open 静默失效飞轮）
+            # ProgrammingError → 飞轮 backend 读写静默失效）
             event_loop = asyncio.get_running_loop()
             response = await event_loop.run_in_executor(
                 self._handler_executor, harness.handle, text

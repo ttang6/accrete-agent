@@ -69,7 +69,7 @@ def check_provenance(
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """出处核对（最小版）：fingerprint 必须在本轮候选原文里出现，否则剔除。
 
-    返回 (kept, dropped)。candidates 是本轮所有 tool 成功输出的原文（TurnContext
+    返回 (kept, dropped)。candidates 是本轮所有 tool 成功输出的原文（AgentRuntimeState
     攒的）。判据是子串命中——便宜、防的是"凭空造一条候选集里根本没有的 paper"这种
     最丢人的失败；不做链接 resolve（留后）。无候选（candidates 空）时一律判 dropped，
     宁可不登记也不登记来路不明的条目。

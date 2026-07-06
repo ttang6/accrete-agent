@@ -22,7 +22,6 @@ from dotenv import load_dotenv
 import main as cli_main
 from nanoagent.core.llm_client import LLMClient
 from nanoagent.memory.user_facts import UserFacts
-from nanoagent.runtime.critic import Critic
 from nanoagent.runtime.harness import Harness
 from nanoagent.runtime.session import SessionStore
 from nanoagent.runtime.telegram_channel import (
@@ -56,12 +55,10 @@ def build_harness_factory(
     store: SessionStore,
     loader: SkillLoader,
     user_facts: UserFacts,
-    critic: Optional[Critic],
+    critic_llm,
     lesson_retriever,
     outcome_tracker,
     lesson_ingestor,
-    promotion_gate,
-    promotion_audit_callback=None,
     global_memory=None,
     global_memory_distiller=None,
 ):
@@ -81,12 +78,10 @@ def build_harness_factory(
             user_facts=user_facts,
             session_key=bootstrap_key,
             base_identity=cli_main.BASE_IDENTITY,
-            critic=critic,
+            critic_llm=critic_llm,
             critic_max_revise=cli_main.EVALUATOR_MAX_RETRIES,
             outcome_tracker=outcome_tracker,
             lesson_ingestor=lesson_ingestor,
-            promotion_gate=promotion_gate,
-            promotion_audit_callback=promotion_audit_callback,
             session_key_prefix=prefix,
             global_memory=global_memory,
             global_memory_distiller=global_memory_distiller,
@@ -121,7 +116,7 @@ async def run_bot() -> int:
     # Telegram channel 在单 worker ThreadPoolExecutor 跑 handle，但装配仍在
     # main thread；sqlite check_same_thread=False 让 connection 跨"装配 thread →
     # 单 worker thread"使用。多 worker 并发写不安全，靠 channel 单 worker 串行护住。
-    lesson_retriever, outcome_tracker, lesson_ingestor, promotion_gate = \
+    lesson_retriever, outcome_tracker, lesson_ingestor = \
         cli_main.build_runtime_memory(sqlite_check_same_thread=False)
     store = SessionStore(persist_dir=cli_main.SESSION_DIR)
     user_facts = UserFacts(cli_main.USER_FACTS_PATH)
@@ -134,7 +129,7 @@ async def run_bot() -> int:
         if os.getenv("DASHSCOPE_API_KEY") else None
     )
 
-    critic: Optional[Critic] = None
+    critic_llm = None
     if os.getenv("DASHSCOPE_API_KEY"):
         critic_llm = LLMClient(
             model=cli_main.EVALUATOR_MODEL,
@@ -142,27 +137,18 @@ async def run_bot() -> int:
             instance_name="critic",
             timeout=cli_main.EVALUATOR_TIMEOUT,
         )
-        critic = Critic(llm=critic_llm)
         print(
             f"[Critic] enabled: {cli_main.EVALUATOR_PROVIDER}/{cli_main.EVALUATOR_MODEL}"
         )
-
-    promotion_audit_callback = (
-        cli_main.JsonlAuditWriter(cli_main.PROMOTION_AUDIT_LOG_PATH)
-        if promotion_gate is not None and cli_main.PROMOTION_AUDIT_LOG_PATH
-        else None
-    )
 
     factory = build_harness_factory(
         store=store,
         loader=loader,
         user_facts=user_facts,
-        critic=critic,
+        critic_llm=critic_llm,
         lesson_retriever=lesson_retriever,
         outcome_tracker=outcome_tracker,
         lesson_ingestor=lesson_ingestor,
-        promotion_gate=promotion_gate,
-        promotion_audit_callback=promotion_audit_callback,
         global_memory=global_memory,
         global_memory_distiller=global_memory_distiller,
     )

@@ -50,7 +50,6 @@ SOURCE_LEARNED: Final[str] = "learned"
 
 SOURCE_GATE: Final[str] = "gate"
 """框架硬要求 / 拦截类注入（`[gate-*]`）：
-  - [gate-coverage]        (CoverageChecker 覆盖不达标；v3-2b 后 synthetic 注入退役、保留观测)
   - [gate-required-action] (RequiredActionGate；v3-2b 整条退役，marker 保留词表占位)
   - [gate-invalid-call]    (RepairGate schema 校验拦下)
   - [gate-circuit-open]    (per-op 熔断)
@@ -87,7 +86,6 @@ MARKER_LEARNED_FIX: Final[str] = "[learned-fix]"
 MARKER_LEARNED_HYPOTHESIS: Final[str] = "[learned-hypothesis]"
 
 # --- gate（框架硬要求·拦截）---
-MARKER_GATE_COVERAGE: Final[str] = "[gate-coverage]"
 # REQUIRED_ACTION：RequiredActionGate 退役（v3-2b）后已无 emitter，保留占位。
 MARKER_GATE_REQUIRED_ACTION: Final[str] = "[gate-required-action]"
 MARKER_GATE_INVALID_CALL: Final[str] = "[gate-invalid-call]"
@@ -103,7 +101,6 @@ ALL_MARKERS: Final[frozenset[str]] = frozenset({
     MARKER_LEARNED_EXAMPLE,
     MARKER_LEARNED_FIX,
     MARKER_LEARNED_HYPOTHESIS,
-    MARKER_GATE_COVERAGE,
     MARKER_GATE_REQUIRED_ACTION,
     MARKER_GATE_INVALID_CALL,
     MARKER_GATE_CIRCUIT_OPEN,

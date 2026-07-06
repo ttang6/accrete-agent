@@ -12,14 +12,14 @@ from nanoagent.core import trace_schema as ts
 from nanoagent.core.metrics import metrics
 from nanoagent.core.paths import data_dir
 from nanoagent.memory.user_facts import UserFacts
-from nanoagent.runtime.critic import Critic
+from nanoagent.runtime.critic import review as critic_review
 from nanoagent.runtime.main_loop import MainLoop
 from nanoagent.runtime.publish import (
     check_provenance,
     extract_adopted_items,
     mark_published_items,
 )
-from nanoagent.runtime.session import SessionStore
+from nanoagent.runtime.session import SessionStore, _safe_filename
 from nanoagent.runtime.token_counter import TokenCounter
 from nanoagent.skills.loader import SkillLoader
 
@@ -28,15 +28,11 @@ if TYPE_CHECKING:
     from nanoagent.memory.global_memory import GlobalMemory
     from nanoagent.memory.global_memory_distiller import GlobalMemoryDistiller
     from nanoagent.evolution.runtime_memory.outcome_tracker import OutcomeTracker
-    from nanoagent.evolution.runtime_memory.promotion_gate import (
-        AuditCallback,
-        PromotionGate,
-    )
 
 _logger = logging.getLogger("nanoagent.harness")
 
 # 不能作为 /<skill> 快捷命令使用。
-_RESERVED_SLASH_CMDS = frozenset({"clear", "new", "sessions", "resume", "skill", "skills", "profile", "digest"})
+_RESERVED_SLASH_CMDS = frozenset({"clear", "new", "sessions", "resume", "skill", "skills", "profile", "digest", "rewind"})
 
 # /digest 发布日报时跑的 skill 与合成任务（发布是确定性命令入口，不靠自然语言猜意图）。
 _DIGEST_SKILL = "ai-digest"
@@ -103,12 +99,10 @@ class Harness:
         session_key: str,
         base_identity: str,
         digests_dir: Optional[Path] = None,
-        critic: Optional[Critic] = None,
+        critic_llm=None,
         critic_max_revise: int = 1,
         outcome_tracker: Optional["OutcomeTracker"] = None,
         lesson_ingestor: Optional["LessonIngestor"] = None,
-        promotion_gate: Optional["PromotionGate"] = None,
-        promotion_audit_callback: Optional["AuditCallback"] = None,
         session_key_prefix: str = _DEFAULT_SESSION_PREFIX,
         session_history_warn_tokens: int = _SESSION_HISTORY_WARN_TOKENS_DEFAULT,
         global_memory: Optional["GlobalMemory"] = None,
@@ -124,19 +118,14 @@ class Harness:
         self._session_key = session_key
         self._base_identity = base_identity
         self._digests_dir = digests_dir
-        # critic：发布流程里的质量评审子 agent（非阻断、最多触发一轮 revise）。
-        self._critic = critic
+        # critic_llm：发布流程里的质量评审副 LLM（非阻断、最多触发一轮 revise）。
+        # None → 跳过评审。评审逻辑在 critic.review（模块级函数）。
+        self._critic_llm = critic_llm
         self._critic_max_revise = critic_max_revise
         self._outcome_tracker = outcome_tracker
         # trace 写完后扫 failure 自动产 candidate lesson 入 backend
         # None 时退化到旧行为（仅手动 backfill 能造 candidate）
         self._lesson_ingestor = lesson_ingestor
-        # 在 OutcomeTracker / Ingestor 之后扫 backend 自动 promote/retire
-        self._promotion_gate = promotion_gate
-        # 每次 sweep 命中转移时调一次（fail-open 由 sweep 兜底），
-        # 默认 None 行为与之前一致。装配层（main.py）通常注入 JsonlAuditWriter
-        # 把决策追加到 data/runtime/lessons/promotion_audit.jsonl。
-        self._promotion_audit_callback = promotion_audit_callback
         self._session_key_prefix = session_key_prefix
         # Session 级 context budget（最小版，对齐 nanobot：只量+提醒、不自动截断）。
         # Harness 自持一份 TokenCounter（谁用谁持），不伸手进 MainLoop 的内部字段。
@@ -233,6 +222,9 @@ class Harness:
             self._store.set_meta(self._session_key, current_skill=name)
             return self._sys(f"已切入 skill: {name}")
 
+        if text == "/rewind" or text.startswith("/rewind "):
+            return self._handle_rewind(text)
+
         if text == "/digest":
             return self._handle_digest()
 
@@ -275,7 +267,7 @@ class Harness:
     def _open_new_session(self) -> HarnessResponse:
         """显式 /new / /clear：创建并切换，返回用户可见的系统消息。"""
         # 切走当前 session 前：够厚（≥switch 阈值）就把这段对话蒸进全局记忆。
-        self._maybe_auto_distill("switch", self._auto_distill_switch_ratio)
+        self._after_turn_auto_distill("switch", self._auto_distill_switch_ratio)
         new_key = self._create_and_switch_to_new_session()
         return self._sys(f"已开新会话：{new_key}（用 /sessions 查看历史会话）")
 
@@ -305,10 +297,107 @@ class Harness:
             self._fresh_session_pending = False  # 显式表态后续在此 session 继续
             return self._sys(f"当前已是 {target_key}")
         # 切走当前 session 前：够厚就蒸一次。
-        self._maybe_auto_distill("switch", self._auto_distill_switch_ratio)
+        self._after_turn_auto_distill("switch", self._auto_distill_switch_ratio)
         self._switch_session(target_key)
         self._fresh_session_pending = False
         return self._sys(f"已切回 {target_key}")
+
+    def _handle_rewind(self, text: str) -> HarnessResponse:
+        """`/rewind`：列出各轮供选；`/rewind <n>`：回到第 n 轮之前（删掉第 n 轮及其后）。
+
+        无参先给编号列表（看着选，不盲报数字）；带 n 才真回退：①把回退前的完整历史归档成
+        fork 副本（废弃分支 = 带步级位置的隐式标注，"用户认为问题不晚于此"）②活跃层截断掉
+        第 n 轮及其后 ③返回一条**只打分隔线不擦屏**的系统消息。截断后继续输入即从该点接着走。
+        """
+        turns = self._turns_view()
+        if not turns:
+            return self._sys("当前会话没有可回退的对话。")
+
+        parts = text.split(None, 1)
+        if len(parts) == 1:                       # 无参 → 列表选择
+            return self._sys(self._render_rewind_list(turns))
+
+        arg = parts[1].strip()
+        if not arg.isdigit() or not (1 <= int(arg) <= len(turns)):
+            return self._sys(
+                f"用法：/rewind 看轮次列表；/rewind <n> 回到第 n 轮之前（n=1..{len(turns)}）"
+            )
+        n = int(arg)
+
+        forked = self._archive_rewind_fork()          # 先归档截断前的完整分支
+        # 回到第 n 轮之前 = 删掉第 n..末轮 = 删掉末尾 (总轮数 - n + 1) 轮
+        removed = self._store.rewind_turns(self._session_key, len(turns) - n + 1)
+
+        divider = "─" * 48
+        lines = [
+            divider,
+            f"↩ 已回到第 {n} 轮之前（删掉 {removed} 轮，剩 {n - 1} 轮）。",
+        ]
+        if forked:
+            lines.append(f"  废弃分支已归档为 fork 副本：{forked}")
+        lines.append("  继续输入将从这里接着走。")
+        return self._sys("\n".join(lines))
+
+    def _turns_view(self) -> list[tuple[str, str]]:
+        """把当前会话历史拍成逐轮的 (user 预览, assistant 预览) 列表。
+
+        按 user 消息定界（一轮 = 一条 user 打头），对末尾半截（有 user 无 assistant）也稳。
+
+        Returns:
+            每轮一个 (user_preview, assistant_preview) 元组，按时间顺序。
+        """
+        history = self._store.get(self._session_key)
+        if history is None:
+            return []
+        turns: list[tuple[str, str]] = []
+        cur_user: Optional[str] = None
+        for m in history.get_history():
+            role = m.get("role")
+            if role == "user":
+                if cur_user is not None:
+                    turns.append((cur_user, ""))
+                cur_user = self._preview(m.get("content", ""))
+            elif role == "assistant" and cur_user is not None:
+                turns.append((cur_user, self._preview(m.get("content", ""))))
+                cur_user = None
+        if cur_user is not None:
+            turns.append((cur_user, ""))
+        return turns
+
+    def _render_rewind_list(self, turns: list[tuple[str, str]]) -> str:
+        """把逐轮视图渲染成编号列表（越靠下越新）。"""
+        lines = ["选一个轮次回退（越靠下越新）："]
+        for i, (user_preview, _assistant_preview) in enumerate(turns, 1):
+            lines.append(f"  [{i}] {user_preview}")
+        lines.append(
+            f"用 /rewind <n> 回到第 n 轮之前（删掉第 n 轮及其后，n=1..{len(turns)}）"
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _preview(content: str, max_chars: int = 48) -> str:
+        """把一条消息压成单行短预览（折叠空白 + 超长截断加省略号）。"""
+        one_line = " ".join((content or "").split())
+        if len(one_line) > max_chars:
+            return one_line[:max_chars - 1] + "…"
+        return one_line or "(空)"
+
+    def _archive_rewind_fork(self) -> Optional[str]:
+        """把回退前的完整历史冷存为 fork 副本（snapshots/，不自动 hydrate）。
+
+        best-effort：无 persist_dir / 落盘失败时返回 None，不阻断回退本身。副本是采集件——
+        废弃分支保留下来当"人指着轨迹说问题不晚于此"的隐式失败标注。
+
+        Returns:
+            成功时返回 snapshot 名，失败返回 None。
+        """
+        name = f"rewind_{_safe_filename(self._session_key)}_{secrets.token_hex(3)}"
+        try:
+            self._store.save_snapshot(self._session_key, name)
+            return name
+        except Exception as e:
+            _logger.warning(f"[rewind] fork 归档失败（已忽略，仍继续回退）: {e}")
+            return None
 
     def _list_sessions(self, limit: Optional[int] = 10) -> HarnessResponse:
         """默认只列最近 limit 个；limit=None 列全部。
@@ -403,13 +492,13 @@ class Harness:
         base_history = history.get_history() if history is not None else []
         turn_messages = base_history + [{"role": "user", "content": text}]
 
-        # Session 记账基准：本轮跑前快照累计用量，turn 结束算 delta。
-        # run_bot 多 chat 共享同一 llm 实例，但单 worker 串行执行 → 本轮"前→后"
-        # 差值仍只反映本轮（不被其他 chat 干扰）。
+        # Session 记账基准：llm.usage 是该实例自启动起的累计量（一个 chat 的 llm
+        # 跨多轮持续累加），故本轮跑前快照、turn 结束相减，才隔离出本轮 delta。
+        # 每个 chat 在 build_loop 时各自新建 llm（见 run_bot），不共享、无跨 chat 干扰。
         usage_before = self._loop.llm.usage.snapshot()
 
         # 发布轮可能触发一轮 critic revise（复用同一 tracer），故延后 trace 落盘。
-        defer_save = publish and self._critic is not None
+        defer_save = publish and self._critic_llm is not None
         answer = self._loop.run(
             messages=turn_messages,
             save_on_finish=not defer_save,
@@ -417,16 +506,16 @@ class Harness:
 
         if defer_save:
             try:
-                answer = self._maybe_critic_revise(answer, turn_messages)
+                answer = self._after_turn_reflection(answer, turn_messages)
             finally:
                 self._loop.finalize_trace()
 
         # ingest 在 outcome 之前——新 candidate 写入与已有 lesson 的
         # stats 更新读写不冲突，但顺序上"先记新失败、再评估已用 lesson"更直观
-        self._maybe_ingest_trace()
-        self._maybe_consume_trace_outcomes()
-        # 所有数据写入后扫 backend 决定 promote / retire
-        self._maybe_run_promotion_gate()
+        self._after_turn_ingest_trace()
+        self._after_turn_update_trace_outcomes()
+        # 晋降退休已无独立 sweep：lesson_score 从账本（OutcomeTracker 刚写的
+        # helped/hurt）派生注入闸,下一 turn 召回时现算,无需 turn 末扫库。
 
         self._store.append_turn(self._session_key, text, answer)
         token_delta = self._loop.llm.usage.total_tokens - usage_before.total_tokens
@@ -436,7 +525,7 @@ class Harness:
         if publish:
             self._run_publish_sideeffects(answer)
         # 撑爆触发：本轮结束后若上下文 ≥overflow 阈值，趁老消息被截断前先蒸一次。
-        self._maybe_auto_distill("overflow", self._auto_distill_overflow_ratio)
+        self._after_turn_auto_distill("overflow", self._auto_distill_overflow_ratio)
         content = answer if notice is None else f"{answer}\n\n{notice}"
         return HarnessResponse(
             kind="assistant",
@@ -490,7 +579,7 @@ class Harness:
         self._store.set_meta(self._session_key, **updates)
         return notice
 
-    def _maybe_ingest_trace(self) -> None:
+    def _after_turn_ingest_trace(self) -> None:
         """Trigger LessonIngestor on the just-finalized trace; fail-open."""
         if self._lesson_ingestor is None:
             return
@@ -516,41 +605,7 @@ class Harness:
         except Exception as e:
             _logger.warning(f"LessonIngestor 处理 trace 异常（已 fail-open）: {e}")
 
-    def _maybe_run_promotion_gate(self) -> None:
-        """扫 backend 全部 candidate / probation / promoted，按阈值规则自动转移状态。
-
-        在 Ingestor + OutcomeTracker 之后跑——保证看到的是本 turn 完整数据。
-        fail-open：异常 log warning 不阻塞 user-turn 主流程。
-
-        **why turn 结束才 sweep**（设计意图，非 bug —— PromotionGate 在 turn
-        边界 commit）：
-        - same-turn 内 main_loop 多 iter 时 failure_memory.maybe_augment 在每个
-          tool call 失败时已经查 backend；此时 lesson 必须**已是 PROMOTED 或
-          PROBATION** 才能召回
-        - 把 sweep 提前到 ingest 后立即跑也无济于事——maybe_augment 已经发生过了
-        - 真正避免 race 的方式是依赖跨 turn 数据沉淀：Turn N 失败 ingest →
-          turn 边界 sweep → Turn N+1 才能召回。这是飞轮的设计转速
-        - 不要为 same-turn lesson recall 改系统。否则会把 memory 写入、eval、
-          retry、promotion 搅成难 debug 的循环
-        """
-        if self._promotion_gate is None:
-            return
-        try:
-            decisions = self._promotion_gate.sweep(
-                audit_callback=self._promotion_audit_callback
-            )
-            if decisions:
-                _logger.info(
-                    f"[PromotionGate] sweep applied {len(decisions)}: "
-                    + ", ".join(
-                        f"{d.lesson_id}({d.from_status.value}→{d.to_status.value},{d.reason})"
-                        for d in decisions
-                    )
-                )
-        except Exception as e:
-            _logger.warning(f"PromotionGate sweep 异常（已 fail-open）: {e}")
-
-    def _maybe_consume_trace_outcomes(self) -> None:
+    def _after_turn_update_trace_outcomes(self) -> None:
         """Let OutcomeTracker consume the finalized trace, fail-open.
 
         每条 OutcomeUpdate 通过 RunTracer.append_post_save 写回 trace 末尾的
@@ -574,15 +629,14 @@ class Harness:
                         action=ts.ACTION_OUTCOME_UPDATE,
                         lesson_id=u.lesson_id,
                         outcome=u.outcome.value,
-                        new_confidence=u.new_confidence,
                         new_hit_count=u.new_hit_count,
                     )
                     # metric sink：飞轮 helped/hurt/ineffective 分桶（派生率交 metric 层
-                    # 暴露、不重算——outcome_tracker 已算好 confidence）
+                    # 暴露、不重算）
                     metrics.incr("lesson_outcome_total", outcome=u.outcome.value)
                 _logger.info(
                     f"[OutcomeTracker] 更新 {len(updates)} 条 lesson outcome: "
-                    + ", ".join(f"{u.lesson_id}({u.outcome.value},conf={u.new_confidence:.2f})"
+                    + ", ".join(f"{u.lesson_id}({u.outcome.value},hits={u.new_hit_count})"
                                 for u in updates)
                 )
         except Exception as e:
@@ -598,12 +652,12 @@ class Harness:
         self._store.set_meta(self._session_key, current_skill=_DIGEST_SKILL)
         return self._handle_dialogue(_DIGEST_TASK, publish=True)
 
-    def _maybe_critic_revise(self, answer: str, base_history: list[dict]) -> str:
+    def _after_turn_reflection(self, answer: str, base_history: list[dict]) -> str:
         """critic 审 + 至多一轮 revise。**非阻断**：判不合格也照常发布，verdict 只记录、
         不 gate。critic 是 reflection 的"挑错"半，不是收尾硬闸。"""
-        if self._critic is None or self._critic_max_revise <= 0:
+        if self._critic_llm is None or self._critic_max_revise <= 0:
             return answer
-        verdict = self._critic.review(answer)
+        verdict = critic_review(answer, self._critic_llm)
         self._trace_critic(verdict)
         if verdict.passed or not verdict.critique:
             return answer
@@ -640,8 +694,8 @@ class Harness:
     def _run_publish_sideeffects(self, answer: str) -> None:
         """发布副作用：抽机器块条目 → 出处核对（剔除编造）→ 自动写去重历史 → archive。
         全部 fail-open——已交付的日报不受登记/归档失败影响。"""
-        turn_ctx = getattr(self._loop, "_turn_ctx", None)
-        candidates = list(turn_ctx.candidates) if turn_ctx is not None else []
+        state = getattr(self._loop, "_state", None)
+        candidates = list(state.candidates) if state is not None else []
         items = extract_adopted_items(answer)
         kept, dropped = check_provenance(items, candidates)
         if dropped:
@@ -674,7 +728,7 @@ class Harness:
         except OSError:
             pass
 
-    def _maybe_auto_distill(self, reason: str, ratio: float) -> None:
+    def _after_turn_auto_distill(self, reason: str, ratio: float) -> None:
         """全局自动记忆触发：当前 session 上下文 ≥ ratio×窗口，且该触发点本 session 还没
         蒸过 → 副 LLM 把当前 session 对话蒸进全局长期记忆（独立文件）。fail-open。
 
