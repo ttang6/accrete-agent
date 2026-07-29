@@ -1,0 +1,12 @@
+.pytest_tmp/
+.pytest_cache/
+__pycache__/
+.venv/
+*.egg-info/
+docs/
+AGENTS.md
+CLAUDE.md
+HANDOFF.md
+.env
+uv.lock
+tests/
