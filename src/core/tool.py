@@ -4,8 +4,24 @@ from abc import ABC, abstractmethod
 from enum import Flag, auto
 import time
 
+from .ports import OutputStore
 from .state import elapsed_ms
 from .types import ToolResult
+
+
+def clip_output(text: str, max_chars: int, store: OutputStore | None = None) -> str:
+    """把过长的工具输出截断到 max_chars，并尽量把完整内容交给 store 落盘。
+
+    保留首尾两段：错误上下文通常在开头，结论通常在结尾。没有 store 时只说明省略了
+    多少，不影响工具可用——落盘就位后，截断处会附上完整内容的位置。
+    """
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    head = max_chars * 2 // 3
+    location = store.put(text) if store else None
+    note = f"[已截断：原文 {len(text)} 字符，省略中间 {len(text) - max_chars} 字符"
+    note += f"，完整内容见 {location}]" if location else "]"
+    return f"{text[:head]}\n\n{note}\n\n{text[-(max_chars - head):]}"
 
 
 class AccessType(Flag):

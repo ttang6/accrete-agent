@@ -19,6 +19,20 @@ class NullTracer:
         return None
 
 
+class OutputStore(Protocol):
+    """大体量工具输出的落盘接口。"""
+
+    def put(self, content: str) -> str | None:
+        """存下完整内容并返回可供追溯的位置；无处可存时返回 None。"""
+
+
+class NullOutputStore:
+    """不落盘的输出存储实现；截断掉的内容直接丢弃。"""
+
+    def put(self, content: str) -> str | None:
+        return None
+
+
 class SessionStore(Protocol):
     """会话事实的追加式持久化接口。"""
 
