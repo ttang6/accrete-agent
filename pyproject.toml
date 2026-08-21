@@ -3,20 +3,31 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "accrete-agent"
+name = "accrete"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
+    "datasets>=4.5.0",
     "httpx>=0.28.1",
+    "jsonschema>=4.23",
     "openai>=2.50.0",
+    "pydantic>=2.7",
     "python-dotenv>=1.2.2",
+    "pyyaml>=6.0.3",
     "tavily-python>=0.7.26",
 ]
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["infra*", "targets*", "analyzer*", "evolver*", "grader*"]
 
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "docker: 起真容器的测试。它们守的是隔离，**默认必须跑**；只在快速迭代时用 -m \"not docker\" 跳过。",
 ]
