@@ -1,0 +1,279 @@
+# 模型 API 价格表。**仅供离线分析读取**，src/ 的运行时不认识任何模型价格。
+#
+# 调研时间 2026-08-04（qwen3.7 / qwen3.8-max 与 cn-only 整理 2026-08-10）。
+# 数据来源：各模型官方定价页 / 百炼模型信息页，与第三方追踪站点交叉核对。
+#
+# 键就是配置里写的模型名，与 configs/*.yaml 的 model 字段逐字对应。
+# qwen / deepseek 只保留中国内地（cn）原价；intl 不记。
+# 其余模型若同时有 cn/intl，二者是厂商各自独立标价，**不是汇率换算关系**。
+#
+# 价格字段统一为三个，缺失记 null：
+#   input_per_1m          未命中缓存的输入单价
+#   cached_input_per_1m   命中缓存的输入单价
+#   output_per_1m         输出单价（思考 token 已含在输出里，不另计价）
+#
+# confidence: confirmed 表示有官方或多方独立确认；estimated 表示按比例推断，报告须标注。
+
+as_of: 2026-08-17
+
+billing:
+  # 端点主机 → 计价区域。据此从运行快照里的 provider.base_url 自动选价，
+  # 避免换了 endpoint 而价格没跟着换。
+  endpoint_region:
+    dashscope.aliyuncs.com: cn
+    dashscope-intl.aliyuncs.com: intl
+    api.x.ai: intl
+  # DeepSeek 两个区域共用 api.deepseek.com，主机判定不出来，须按账户显式指定。
+  explicit_region_required:
+    - api.deepseek.com
+  default_region: cn
+
+models:
+
+  qwen3.5-flash:
+    context_window_tokens: 1048576
+    max_output_tokens: 65536
+    prices:
+      cn:
+        currency: CNY
+        input_per_1m: 0.2
+        cached_input_per_1m: null
+        output_per_1m: 0.8
+        confidence: estimated
+        source: "量子位报道（2026-02-25 阿里云百炼国内站官宣价）"
+        notes: >
+          官方新闻稿只明确「输入低至 0.2 元/百万 Token」，输出价未见权威二次确认，
+          按输入约 4 倍推算。以控制台账单为准。
+
+  qwen3.5-plus:
+    context_window_tokens: 1048576
+    prices:
+      cn:
+        currency: CNY
+        input_per_1m: 0.8
+        cached_input_per_1m: null
+        output_per_1m: 4.8
+        confidence: confirmed
+        source: "阿小云 / 阿里云开发者社区（2026-03-28）"
+        tiered: >
+          128K 以内输入价；128K–256K 区间输入涨至 2 元/百万 Token。
+          阶梯计价而非分段计费，整请求按命中档位结算。
+
+  qwen3.6-flash:
+    context_window_tokens: 1048576
+    prices:
+      cn:
+        currency: CNY
+        input_per_1m: 1.2
+        cached_input_per_1m: null
+        output_per_1m: 7.2
+        confidence: confirmed
+        source: "aiapiprice.com（2026-06-15，阿里云百炼中国内地部署官方价）"
+        tiered: "0–256K 输入区间价；更长输入进入更高阶梯"
+
+  qwen3.6-plus:
+    context_window_tokens: 1048576
+    prices:
+      cn:
+        currency: CNY
+        input_per_1m: 2.0
+        cached_input_per_1m: 0.2
+        output_per_1m: 12.0
+        confidence: confirmed
+        source: "阿里云开发者社区（2026-04-06 官方发布）"
+
+  # 调研 2026-08-10。https://help.aliyun.com/zh/model-studio/qwen3-7-flash
+  qwen3.7-flash:
+    context_window_tokens: 1000000
+    max_output_tokens: 131072
+    prices:
+      cn:
+        currency: CNY
+        input_per_1m: 0.2
+        cached_input_per_1m: 0.04
+        output_per_1m: 0.8
+        confidence: confirmed
+        source: "阿里云百炼 qwen3.7-flash 模型信息页（华北2 北京，调用原价）"
+        tiered: >
+          基价取输入 <=32K：0.2 / 0.8 / 缓存 0.04。
+          32K–256K：0.6 / 2.4 / 0.12；256K–1M：1.2 / 4.8 / 0.24。
+          阶梯按单次请求输入总量整档结算。
+        notes: "思考/非思考同价；输出含 reasoning。Batch / 活动价不写入基价。"
+
+  # 调研 2026-08-10。https://help.aliyun.com/zh/model-studio/qwen3-7-plus
+  qwen3.7-plus:
+    context_window_tokens: 1000000
+    max_output_tokens: 131072
+    prices:
+      cn:
+        currency: CNY
+        input_per_1m: 2.0
+        cached_input_per_1m: 0.4
+        output_per_1m: 8.0
+        confidence: confirmed
+        source: "阿里云百炼 qwen3.7-plus 模型信息页（华北2 北京，调用原价）"
+        tiered: >
+          基价取输入 <=256K：2 / 8 / 缓存 0.4。
+          256K–1M：6 / 24 / 1.2。
+        notes: "思考/非思考同价；输出含 reasoning。Batch / 活动价不写入基价。"
+
+  # 调研 2026-08-10。https://help.aliyun.com/zh/model-studio/qwen3-7-max
+  qwen3.7-max:
+    context_window_tokens: 1000000
+    max_output_tokens: 131072
+    prices:
+      cn:
+        currency: CNY
+        input_per_1m: 12.0
+        cached_input_per_1m: 2.4
+        output_per_1m: 36.0
+        confidence: confirmed
+        source: "阿里云百炼 qwen3.7-max 模型信息页（华北2 北京，调用原价）"
+        notes: >
+          输入 12 / 输出 36 / 缓存命中 2.4 元每百万 Token。
+          思考/非思考同价；输出含 reasoning。Batch / 活动价不写入基价。
+
+  # 调研 2026-08-10。https://help.aliyun.com/zh/model-studio/qwen3-8-max
+  qwen3.8-max:
+    context_window_tokens: 1000000
+    max_output_tokens: 131072
+    prices:
+      cn:
+        currency: CNY
+        input_per_1m: 12.0
+        cached_input_per_1m: 1.5
+        output_per_1m: 36.0
+        confidence: confirmed
+        source: "阿里云百炼 qwen3.8-max 模型信息页（华北2 北京，调用原价）"
+        notes: >
+          中国内地站原价：输入 12 / 输出 36 / 缓存命中 1.5 元每百万 Token。
+          思考/非思考同价；输出含 reasoning。Batch / Token Plan 活动不写入基价。
+
+  deepseek-v4-flash:
+    context_window_tokens: 1048576
+    max_output_tokens: 384000
+    prices:
+      cn:
+        currency: CNY
+        input_per_1m: 1.0
+        cached_input_per_1m: 0.02
+        output_per_1m: 2.0
+        confidence: confirmed
+        source: "智东西 / 观察者网 / 阿里云百炼上线报道（2026-04-26 起生效）"
+        notes: "百炼上架版本明确「API 调用价格与官网一致」"
+    notes: "自动磁盘前缀缓存，无需额外配置"
+
+  deepseek-v4-pro:
+    context_window_tokens: 1048576
+    max_output_tokens: 384000
+    prices:
+      cn:
+        currency: CNY
+        input_per_1m: 3.0
+        cached_input_per_1m: 0.025
+        output_per_1m: 6.0
+        confidence: confirmed
+        source: "新浪财经 / 知乎 / IT之家（2026-05-22 官宣，5 月 31 日后永久生效）"
+        notes: "原价输入 12 元 / 输出 24 元 / 缓存命中 0.1 元，此次永久降至 1/4"
+    notes: >
+      已官宣未来可能对北京时间高峰时段（9–12 点、14–18 点）按 2 倍计价，
+      生效日期未定。届时按 token 单价算出的金额会低于实际账单。
+
+  gpt-5.6-luna:
+    context_window_tokens: 1050000
+    max_output_tokens: 128000
+    prices:
+      intl:
+        currency: USD
+        input_per_1m: 0.20
+        cached_input_per_1m: 0.02
+        output_per_1m: 1.20
+        confidence: confirmed
+        source: "OpenAI 官方博客《Advancing the price-performance frontier with GPT-5.6》"
+        notes: "2026-07-30 降价后价格；缓存输入按标准价 10% 计费"
+      cn:
+        currency: CNY
+        input_per_1m: 1.44
+        cached_input_per_1m: 0.144
+        output_per_1m: 8.64
+        confidence: estimated
+        source: "由本表 intl 档按 1 USD = 7.2 CNY 折算，2026-08-10 加入"
+        notes: >
+          折算值而非厂商标价（OpenAI 无人民币标价，一般经第三方网关按美元折算）；
+          用途是和 qwen/deepseek 的人民币数字并排比，汇率或网关变更时需重算，报告须显示 estimated。
+    notes: >
+      api.openai.com 未列入 endpoint_region，按 default_region 走上面 cn 折算档；
+      已核实 gpt-5.6-luna 是账号可直接调用的真实 model id。
+
+  gpt-5.6-terra:
+    context_window_tokens: 1050000
+    max_output_tokens: 128000
+    prices:
+      intl:
+        currency: USD
+        input_per_1m: 2.00
+        cached_input_per_1m: 0.20
+        output_per_1m: 12.00
+        confidence: confirmed
+        source: "OpenAI 官方 GPT-5.6 Terra 模型页（2026-08-13 核验）"
+        notes: "官方标准价；缓存输入按标准输入价 10% 计费"
+        long_context:
+          threshold_input_tokens: 272000
+          input_multiplier: 2.0
+          output_multiplier: 1.5
+      cn:
+        currency: CNY
+        input_per_1m: 14.40
+        cached_input_per_1m: 1.44
+        output_per_1m: 86.40
+        confidence: estimated
+        source: "由本表 intl 档按 1 USD = 7.2 CNY 折算，2026-08-13 加入"
+        notes: >
+          折算值而非厂商标价（OpenAI 无人民币标价，一般经第三方网关按美元折算）；
+          汇率或网关变更时需重算，报告须显示 estimated。
+        long_context:
+          threshold_input_tokens: 272000
+          input_multiplier: 2.0
+          output_multiplier: 1.5
+    notes: >
+      api.openai.com 未列入 endpoint_region，按 default_region 走上面 cn 折算档；
+      输入超过 272K 时，整次请求输入按 2 倍、输出按 1.5 倍计价；
+      已按 OpenAI 官方模型页核验 gpt-5.6-terra 的 model id、上下文窗口和标准价格。
+
+  grok-4.6:
+    context_window_tokens: 500000
+    prices:
+      intl:
+        currency: USD
+        input_per_1m: 2.00
+        cached_input_per_1m: 0.50
+        output_per_1m: 6.00
+        confidence: confirmed
+        source: "xAI 官方模型页 docs.x.ai/developers/models/grok-4.6（2026-08-17 核验）"
+        notes: "标准价适用于 prompt < 200K；缓存输入官方单列为 $0.50/1M"
+        long_context:
+          threshold_input_tokens: 200000
+          input_multiplier: 2.0
+          output_multiplier: 2.0
+      cn:
+        currency: CNY
+        input_per_1m: 14.40
+        cached_input_per_1m: 3.60
+        output_per_1m: 43.20
+        confidence: estimated
+        source: "由本表 intl 档按 1 USD = 7.2 CNY 折算，2026-08-17 加入"
+        notes: >
+          折算值而非厂商标价（xAI 只标美元）；汇率或网关变更时需重算，报告须显示 estimated。
+        long_context:
+          threshold_input_tokens: 200000
+          input_multiplier: 2.0
+          output_multiplier: 2.0
+    notes: >
+      api.x.ai 已列入 endpoint_region=intl，直连官方端点按美元计价；
+      prompt 达到 200K 时整次请求的输入、缓存输入和输出都按 2 倍计价。
+
+disclaimer: >
+  价格来自官方公告与第三方追踪站点。厂商迭代频繁，且存在阶梯计价、地区差异定价、
+  促销价与永久价交替生效等情况，数值可能与最新官网有偏差。
+  尤其 qwen3.5-flash 中国站输出价未找到权威二次确认来源。
+  正式核算成本前请在阿里云百炼控制台与 DeepSeek 官方定价页二次核实。
