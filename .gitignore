@@ -1,12 +1,41 @@
-.pytest_tmp/
-.pytest_cache/
-__pycache__/
+# 环境与构建产物
 .venv/
+__pycache__/
 *.egg-info/
-docs/
+uv.lock
+.pytest_cache/
+.pytest_tmp/
+logs/
+.candidate_worktree/
+.hf_cache/
+grader/sets/evolve_eval_*.txt
+dashscope__*.json
+
+# 本地笔记、密钥与个人工作区，不对外
 AGENTS.md
 CLAUDE.md
+# 例外：这份是 freeze 的必需输入，不是本地笔记。
+!evolver/assets/CLAUDE.md
 HANDOFF.md
+docs/
 .env
-uv.lock
-tests/
+.agent_workspace/
+.obsidian/
+
+# 实验数据：artifacts 是新 Runtime 的不可变证据，archive 保存旧运行产物，
+# analyzer/experiments 保存对历史产物离线分析生成的一次实验 case 等产出。
+artifacts/
+archive/
+grader/gold/
+grader/eval_out/
+analyzer/experiments/
+evolver/experiments/
+.evolve_candidates.git/
+
+# 重设计期间留在本地作对照的旧实现。不进历史也不会丢：这些文件在 95177d7
+# （标签 pre-restructure 之后的最后一次提交）里就是 infra/core/ 与 infra/runtime/。
+
+# 外部 mini-swe-agent 已迁出到仓库外（默认 D:\Python\mini-swe-agent），不纳入本仓库。
+# 若有人误把完整源码放回 targets/，继续忽略，避免脏提交。
+targets/mini_swe_agent/
+targets/mini_swe/vendor/
